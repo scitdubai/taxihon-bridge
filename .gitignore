@@ -1,0 +1,6 @@
+# 1. ملفات جلسة WhatsApp Web
+.wwebjs_auth/
+.wwebjs_cache/
+
+# 2. مجلد مكتبات Node.js
+node_modules/
