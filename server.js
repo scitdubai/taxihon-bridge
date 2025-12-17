@@ -19,8 +19,8 @@ app.use(express.json({ limit: '50mb' }));
 
 // إعداد البورت (3000 للجسر، لأن Next.js على 3001)
 const PORT = 3000;
-const DJANGO_WEBHOOK_URL = 'http://127.0.0.1:8001/webhook/';
-
+// const DJANGO_WEBHOOK_URL = 'http://127.0.0.1:8001/webhook/';
+const DJANGO_WEBHOOK_URL = 'http://api.taxihon.com/webhook/';
 
 // --- 🔥 متغير حالة عام لتخزين الرمز 🔥 ---
 let currentQrCode = null;
