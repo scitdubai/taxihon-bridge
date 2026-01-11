@@ -279,6 +279,14 @@ app.get('/qr-code', (req, res) => {
     }
 });
 
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    service: "wa-bridge",
+    uptime: process.uptime()
+  });
+});
+
 // API الطرد (LID Support)
 app.post('/kick-member', async (req, res) => {
     const { group_id, phone, target_lid } = req.body;
