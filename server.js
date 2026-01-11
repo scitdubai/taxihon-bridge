@@ -16,11 +16,11 @@ const qrcode = require('qrcode-terminal');
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
-
+const ADMIN_BOT_NUMBERS = ['963931698698', '963931697697'];
 // إعداد البورت (3000 للجسر، لأن Next.js على 3001)
 const PORT = 3000;
-// const DJANGO_WEBHOOK_URL = 'http://127.0.0.1:8001/webhook/';
-const DJANGO_WEBHOOK_URL = 'http://api.taxihon.com/webhook/';
+//  const DJANGO_WEBHOOK_URL = 'http://127.0.0.1:8000/webhook/';
+const DJANGO_WEBHOOK_URL = 'https://api.taxihon.com/webhook/';
 
 // --- 🔥 متغير حالة عام لتخزين الرمز 🔥 ---
 let currentQrCode = null;
@@ -152,6 +152,16 @@ client.on('message', async msg => {
     let chatNumber = cleanId(senderFullId); // رقم المجموعة أو الشخص
     let authorNumber = msg.author ? cleanId(msg.author) : null; // رقم الشخص المرسل (داخل المجموعة)
 
+    // ✅ أضف التعديل هنا (بعد استخراج الأرقام وقبل أي شيء آخر)
+    if (ADMIN_BOT_NUMBERS.includes(chatNumber) || (authorNumber && ADMIN_BOT_NUMBERS.includes(authorNumber))) {
+        return; 
+    }
+// التعديل لضمان استخراج الرقم الصافي حتى لو كان LID
+    // let chatNumber = cleanId(senderFullId);
+    // if (chatNumber && chatNumber.includes(':')) chatNumber = chatNumber.split(':')[1];
+
+    // let authorNumber = msg.author ? cleanId(msg.author) : null;
+    // if (authorNumber && authorNumber.includes(':')) authorNumber = authorNumber.split(':')[1];
     // 🔥 استخراج بيانات المجموعة (الاسم + المعرف)
     let groupName = null;
     let groupId = null;
@@ -269,57 +279,69 @@ app.get('/qr-code', (req, res) => {
     }
 });
 
-
-// --- 🔥 API الإرسال (المصحح مع LID Support) 🔥 ---
-app.post('/send-message', async (req, res) => {
-    if (!req.body || (!req.body.phone && !req.body.reply_id) || !req.body.message) {
-        return res.status(400).json({ error: "Missing required fields" });
-    }
-
-    let { phone, message, reply_id } = req.body;
+// API الطرد (LID Support)
+app.post('/kick-member', async (req, res) => {
+    const { group_id, phone, target_lid } = req.body;
+    if (!group_id) return res.status(400).json({ error: "Missing group_id" });
 
     try {
-        let chatId;
+        let chatGroupId = group_id.includes('@g.us') ? group_id : `${group_id}@g.us`;
+        let idToRemove = null;
 
-        if (reply_id) {
-            chatId = reply_id;
-        } else {
-            let cleanPhone = phone.toString().replace(/\D/g, '');
-            if (cleanPhone.startsWith('09')) cleanPhone = '963' + cleanPhone.substring(1);
+        // 1. الأولوية للـ LID القادم من جانغو (لأنه دقيق 100%)
+        if (target_lid) {
+            idToRemove = target_lid.includes('@') ? target_lid : (target_lid.length > 15 ? `${target_lid}@lid` : `${target_lid}@c.us`);
+            console.log(`🎯 [KICK FAST] Using LID: ${idToRemove}`);
+        } 
+        
+        // 2. البحث عن طريق الرقم إذا فشل الـ LID
+        if (!idToRemove && phone) {
+            let targetNumber = phone.toString().replace(/\D/g, '');
+            if (targetNumber.startsWith('09')) targetNumber = '963' + targetNumber.substring(1);
             
-            // كشف LID
-            if (cleanPhone.length >= 15 && !cleanPhone.startsWith('963')) { 
-                chatId = `${cleanPhone}@lid`;
-            } else {
-                chatId = `${cleanPhone}@c.us`;
-            }
+            const chat = await client.getChatById(chatGroupId);
+            const victim = chat.participants.find(p => p.id.user === targetNumber);
+            if (victim) idToRemove = victim.id._serialized;
         }
 
-        console.log(`⏳ [SEND] To: ${chatId}`);
-
-        try {
-            await client.sendMessage(chatId, message);
-        } catch (sendError) {
-            console.warn(`⚠️ Direct send failed to ${chatId}, attempting fallback...`);
-            // التبديل بين @c.us و @lid
-            let fallbackId = chatId.endsWith('@c.us') ? chatId.replace('@c.us', '@lid') : chatId.replace('@lid', '@c.us');
-            console.log(`🔄 Retrying with: ${fallbackId}`);
-            await client.sendMessage(fallbackId, message);
+        if (idToRemove) {
+            const chat = await client.getChatById(chatGroupId);
+            await chat.removeParticipants([idToRemove]);
+            console.log(`👋 [KICK SUCCESS] Removed ${idToRemove}`);
+            res.json({ status: 'success' });
+        } else {
+            res.status(404).json({ error: "User not found" });
         }
-
-        console.log(`📤 [SENT] Success`);
-        res.json({ status: 'success' });
-
     } catch (e) {
-        console.error(`❌ Send Failed: ${e.message}`);
+        console.error(`❌ Kick Error: ${e.message}`);
         res.status(500).json({ error: e.message });
     }
 });
 
-// تشغيل الخادم
-client.initialize();
-app.listen(PORT, () => console.log(`🚀 Bridge Running on ${PORT}`));
+app.post('/send-message', async (req, res) => {
+    const { phone, message, reply_id } = req.body;
+    if (!message) return res.status(400).json({ error: "No message" });
 
+    try {
+        let chatId = reply_id;
+        if (!chatId) {
+            let clean = phone.toString().replace(/\D/g, '');
+            if (clean.startsWith('1203')) chatId = `${clean}@g.us`;
+            else {
+                if (clean.startsWith('09')) clean = '963' + clean.substring(1);
+                chatId = (clean.length > 15) ? `${clean}@lid` : `${clean}@c.us`;
+            }
+        }
+        await client.sendMessage(chatId, message);
+        res.json({ status: 'success' });
+    } catch (e) {
+        console.error(`❌ Send Error: ${e.message}`);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+client.initialize();
+app.listen(PORT, () => console.log(`🚀 Bridge on ${PORT}`));
 // /**
 //  * TaxiHon WhatsApp Bridge - Ultimate Resilient Version
 //  * Features: 
