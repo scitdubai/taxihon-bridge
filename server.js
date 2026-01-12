@@ -18,10 +18,14 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 const ADMIN_BOT_NUMBERS = ['963931698698', '963931697697'];
 // إعداد البورت (3000 للجسر، لأن Next.js على 3001)
-const PORT = 3000;
-//  const DJANGO_WEBHOOK_URL = 'http://127.0.0.1:8000/webhook/';
-const DJANGO_WEBHOOK_URL = 'https://api.taxihon.com/webhook/';
+// const PORT = 3000;
+// const DJANGO_WEBHOOK_URL = 'http://127.0.0.1:8000/webhook/';
+// const DJANGO_WEBHOOK_URL = 'https://api.taxihon.com/webhook/';
+// ✅ التعديل: قراءة البورت والرابط من متغيرات البيئة (أو استخدام المحلي كاحتياطي)
+const PORT = process.env.PORT || 3000;
 
+// هذا السطر هو الأهم: سيقرأ الرابط من Coolify، وإذا لم يجده سيستخدم الرابط المحلي
+const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://127.0.0.1:8000/webhook/';
 // --- 🔥 متغير حالة عام لتخزين الرمز 🔥 ---
 let currentQrCode = null;
 // --- 🔥 نهاية متغير الحالة ---
