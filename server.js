@@ -3,13 +3,13 @@
  * Fixes: ERR_REQUIRE_ESM (Dynamic Import Implemented)
  */
 
-process.on('unhandledRejection', (r) => console.error('❌ UNHANDLED REJECTION:', r));
-process.on('uncaughtException', (e) => console.error('❌ UNCAUGHT EXCEPTION:', e));
+import express from "express";
+import axios from "axios";
+import qrcodeTerminal from "qrcode-terminal";
+import pino from "pino";
 
-const express = require('express');
-const axios = require('axios');
-const qrcodeTerminal = require('qrcode-terminal');
-const pino = require('pino');
+process.on("unhandledRejection", (r) => console.error("❌ UNHANDLED REJECTION:", r));
+process.on("uncaughtException", (e) => console.error("❌ UNCAUGHT EXCEPTION:", e));
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
@@ -21,6 +21,8 @@ const ADMIN_BOT_NUMBERS = ['963931698698', '963931697697'];
 
 let sock;
 let currentQrCode = null;
+let isWaConnected = false;
+let isStarting = false;
 
 // --- 🔥 نظام الطابور (Queue System) 🔥 ---
 let pendingQueue = [];
@@ -66,7 +68,7 @@ async function sendToDjango(payload, msgKey = null) {
 // --- 🛠️ أدوات المعرفات (JID Helper) ---
 const getJid = (number) => {
     if (!number) return null;
-    let clean = String(number).replace(/\D/g, ''); 
+    let clean = String(number).replace(/\D/g, '');
 
     if (String(number).includes('@')) return number;
     if (clean.length < 5) return null;
@@ -79,7 +81,7 @@ const getJid = (number) => {
 
     // 3. أرقام عادية
     if (clean.startsWith('09')) clean = '963' + clean.substring(1);
-    
+
     return `${clean}@s.whatsapp.net`;
 };
 
@@ -90,152 +92,185 @@ function cleanId(jid) {
 
 // --- 🚀 تشغيل الواتساب (Baileys Engine) ---
 async function startWhatsApp() {
-    // 🔥 التعديل هنا: استيراد ديناميكي (Dynamic Import) لحل مشكلة ESM
-    const { 
-        default: makeWASocket, 
-        useMultiFileAuthState, 
-        DisconnectReason, 
-        fetchLatestBaileysVersion, 
-        downloadMediaMessage
-    } = await import('@whiskeysockets/baileys');
-    
-    const { Boom } = await import('@hapi/boom');
+    // ✅ قفل يمنع تشغيل startWhatsApp مرتين بنفس الوقت
+    if (isStarting) {
+        console.log("⏳ startWhatsApp skipped (already starting)...");
+        return;
+    }
+    isStarting = true;
 
-    const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
-    const { version } = await fetchLatestBaileysVersion();
+    try {
+        // 🔥 التعديل هنا: استيراد ديناميكي (Dynamic Import) لحل مشكلة ESM
+        const {
+            default: makeWASocket,
+            useMultiFileAuthState,
+            DisconnectReason,
+            fetchLatestBaileysVersion,
+            downloadMediaMessage
+        } = await import('@whiskeysockets/baileys');
 
-    console.log(`⏳ Starting WhatsApp Client (v${version.join('.')})...`);
+        const { Boom } = await import('@hapi/boom');
 
-    sock = makeWASocket({
-        version,
-        auth: state,
-        printQRInTerminal: false, // سنطبعه يدوياً
-        logger: pino({ level: 'silent' }),
-        browser: ["TaxiHon", "Chrome", "1.0.0"], 
-        syncFullHistory: false, 
-        connectTimeoutMs: 60000,
-        retryRequestDelayMs: 2000,
-        markOnlineOnConnect: true
-    });
+        const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
+        const { version } = await fetchLatestBaileysVersion();
 
-    sock.ev.on('creds.update', saveCreds);
+        console.log(`⏳ Starting WhatsApp Client (v${version.join('.')})...`);
 
-    // إدارة الاتصال
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        
-        if (qr) {
-            currentQrCode = qr;
-            qrcodeTerminal.generate(qr, { small: true });
-            console.log(`🔗 QR URL: http://localhost:${PORT}/qr-code`);
-        }
-        
-        if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error instanceof Boom) ? 
-                lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut : true;
-            console.error(`❌ Disconnected! Reconnecting: ${shouldReconnect}`);
-            if (shouldReconnect) startWhatsApp();
-        } else if (connection === 'open') {
-            console.log('✅ WhatsApp Bridge Ready!');
-            currentQrCode = null;
-            if (pendingQueue.length > 0) processQueue();
-        }
-    });
+        sock = makeWASocket({
+            version,
+            auth: state,
+            printQRInTerminal: false, // سنطبعه يدوياً
+            logger: pino({ level: 'silent' }),
+            browser: ["TaxiHon", "Chrome", "1.0.0"],
+            syncFullHistory: false,
+            connectTimeoutMs: 60000,
+            retryRequestDelayMs: 2000,
+            markOnlineOnConnect: true
+        });
 
-    // استقبال الرسائل
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
+        sock.ev.on('creds.update', saveCreds);
 
-        for (const msg of messages) {
-            try {
-                if (msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
+        // إدارة الاتصال
+        sock.ev.on('connection.update', (update) => {
+            const { connection, lastDisconnect, qr } = update;
+            isWaConnected = connection === 'open';
 
-                // --- استخراج البيانات ---
-                const remoteJid = msg.key.remoteJid;
-                const isGroup = remoteJid.endsWith('@g.us');
-                const senderId = cleanId(remoteJid);
-                
-                // 🔥 استخراج هوية المشارك بدقة (LID أو عادي)
-                const participantFull = msg.key.participant || null;
-                const authorId = participantFull ? cleanId(participantFull) : null;
-
-                if (ADMIN_BOT_NUMBERS.includes(senderId) || (authorId && ADMIN_BOT_NUMBERS.includes(authorId))) continue;
-
-                const messageContent = msg.message;
-                if (!messageContent) continue;
-
-                // التعامل مع التعديل
-                if (messageContent.protocolMessage && messageContent.protocolMessage.type === 14) {
-                     const editedKey = messageContent.protocolMessage.key;
-                     const newText = messageContent.protocolMessage.editedMessage?.conversation || "";
-                     console.log(`✏️ [EDIT] ID: ${editedKey.id}`);
-                     sendToDjango({
-                        event_type: 'message_edit',
-                        whatsapp_message_id: editedKey.id,
-                        message_text: newText,
-                        sender_id: senderId
-                     });
-                     continue;
-                }
-
-                // تحديد النوع والنص
-                const msgType = Object.keys(messageContent)[0];
-                let body = messageContent.conversation || 
-                           messageContent.extendedTextMessage?.text || 
-                           messageContent.imageMessage?.caption || "";
-
-                // --- 🎨 اللوج المحترم ---
-                const typeIcon = (msgType === 'audioMessage' || msgType === 'pttMessage') ? '🎤' : (msgType === 'imageMessage' ? '🖼️' : '📄');
-                const lidTag = (participantFull && participantFull.includes('lid')) ? '(LID)' : '';
-                
-                if (isGroup) {
-                    console.log(`📢 [GP] ${senderId} | 👤 ${authorId} ${lidTag} | ${typeIcon}`);
-                } else {
-                    console.log(`📩 [DM] ${senderId} | ${typeIcon}`);
-                }
-
-                // بناء البايلود
-                let payload = {
-                    event_type: 'new_message',
-                    whatsapp_message_id: msg.key.id,
-                    sender_id: senderId,
-                    group_id: isGroup ? remoteJid : null,
-                    author_id: authorId,
-                    participant_raw: participantFull, // 🔥 المعرف الخام للرياكشن
-                    is_group: isGroup,
-                    message_text: body,
-                    has_media: false
-                };
-
-                // معالجة الموقع
-                if (msgType === 'locationMessage') {
-                    const loc = messageContent.locationMessage;
-                    payload.location = { lat: loc.degreesLatitude, lng: loc.degreesLongitude };
-                    payload.message_text = `GPS: ${loc.degreesLatitude},${loc.degreesLongitude}`;
-                }
-
-                // معالجة الميديا
-                if (['imageMessage', 'audioMessage', 'videoMessage'].includes(msgType)) {
-                    try {
-                        const buffer = await downloadMediaMessage(
-                            msg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
-                        );
-                        if (buffer) {
-                            payload.has_media = true;
-                            payload.media_data = buffer.toString('base64');
-                            payload.media_type = msgType === 'audioMessage' ? 'audio/ogg' : 'image/jpeg';
-                            if (msgType === 'audioMessage') payload.message_text = "";
-                        }
-                    } catch (e) { console.error('⚠️ Media Download Skipped'); }
-                }
-
-                sendToDjango(payload, msg.key);
-
-            } catch (err) {
-                console.error("Processing Error:", err.message);
+            if (qr) {
+                currentQrCode = qr;
+                qrcodeTerminal.generate(qr, { small: true });
+                console.log(`🔗 QR URL: http://localhost:${PORT}/qr-code`);
             }
-        }
-    });
+
+            if (connection === 'close') {
+                // ✅ حماية: lastDisconnect قد يكون undefined
+                const err = lastDisconnect?.error;
+
+                const shouldReconnect = (err instanceof Boom)
+                    ? err.output.statusCode !== DisconnectReason.loggedOut
+                    : true;
+
+                console.error(`❌ Disconnected! Reconnecting: ${shouldReconnect}`);
+
+                if (shouldReconnect) {
+                    // ✅ مهم جداً: فك القفل قبل إعادة التشغيل
+                    isStarting = false;
+                    startWhatsApp();
+                } else {
+                    // Logged out: خلي القفل مفكوك حتى تقدر تعمل start لاحقاً بعد تنظيف auth مثلاً
+                    isStarting = false;
+                }
+            } else if (connection === 'open') {
+                console.log('✅ WhatsApp Bridge Ready!');
+                currentQrCode = null;
+
+                // ✅ نجاح: فك القفل
+                isStarting = false;
+
+                if (pendingQueue.length > 0) processQueue();
+            }
+        });
+
+        // استقبال الرسائل
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            console.log("📩 Raw Message Received:", JSON.stringify(messages[0].key, null, 2));
+            if (type !== 'notify') return;
+
+            for (const msg of messages) {
+                try {
+                    if (msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
+
+                    // --- استخراج البيانات ---
+                    const remoteJid = msg.key.remoteJid;
+                    const isGroup = remoteJid.endsWith('@g.us');
+                    const senderId = cleanId(remoteJid);
+
+                    // 🔥 استخراج هوية المشارك بدقة (LID أو عادي)
+                    const participantFull = msg.key.participant || null;
+                    const authorId = participantFull ? cleanId(participantFull) : null;
+
+                    if (ADMIN_BOT_NUMBERS.includes(senderId) || (authorId && ADMIN_BOT_NUMBERS.includes(authorId))) continue;
+
+                    const messageContent = msg.message;
+                    if (!messageContent) continue;
+
+                    // التعامل مع التعديل
+                    if (messageContent.protocolMessage && messageContent.protocolMessage.type === 14) {
+                        const editedKey = messageContent.protocolMessage.key;
+                        const newText = messageContent.protocolMessage.editedMessage?.conversation || "";
+                        console.log(`✏️ [EDIT] ID: ${editedKey.id}`);
+                        sendToDjango({
+                            event_type: 'message_edit',
+                            whatsapp_message_id: editedKey.id,
+                            message_text: newText,
+                            sender_id: senderId
+                        });
+                        continue;
+                    }
+
+                    // تحديد النوع والنص
+                    const msgType = Object.keys(messageContent)[0];
+                    let body = messageContent.conversation ||
+                        messageContent.extendedTextMessage?.text ||
+                        messageContent.imageMessage?.caption || "";
+
+                    // --- 🎨 اللوج المحترم ---
+                    const typeIcon = (msgType === 'audioMessage' || msgType === 'pttMessage') ? '🎤' : (msgType === 'imageMessage' ? '🖼️' : '📄');
+                    const lidTag = (participantFull && participantFull.includes('lid')) ? '(LID)' : '';
+
+                    if (isGroup) {
+                        console.log(`📢 [GP] ${senderId} | 👤 ${authorId} ${lidTag} | ${typeIcon}`);
+                    } else {
+                        console.log(`📩 [DM] ${senderId} | ${typeIcon}`);
+                    }
+
+                    // بناء البايلود
+                    let payload = {
+                        event_type: 'new_message',
+                        whatsapp_message_id: msg.key.id,
+                        sender_id: senderId,
+                        group_id: isGroup ? remoteJid : null,
+                        author_id: authorId,
+                        participant_raw: participantFull, // 🔥 المعرف الخام للرياكشن
+                        is_group: isGroup,
+                        message_text: body,
+                        has_media: false
+                    };
+
+                    // معالجة الموقع
+                    if (msgType === 'locationMessage') {
+                        const loc = messageContent.locationMessage;
+                        payload.location = { lat: loc.degreesLatitude, lng: loc.degreesLongitude };
+                        payload.message_text = `GPS: ${loc.degreesLatitude},${loc.degreesLongitude}`;
+                    }
+
+                    // معالجة الميديا
+                    if (['imageMessage', 'audioMessage', 'videoMessage'].includes(msgType)) {
+                        try {
+                            const buffer = await downloadMediaMessage(
+                                msg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+                            );
+                            if (buffer) {
+                                payload.has_media = true;
+                                payload.media_data = buffer.toString('base64');
+                                payload.media_type = msgType === 'audioMessage' ? 'audio/ogg' : 'image/jpeg';
+                                if (msgType === 'audioMessage') payload.message_text = "";
+                            }
+                        } catch (e) { console.error('⚠️ Media Download Skipped'); }
+                    }
+
+                    sendToDjango(payload, msg.key);
+
+                } catch (err) {
+                    console.error("Processing Error:", err.message);
+                }
+            }
+        });
+
+    } catch (err) {
+        console.error("❌ startWhatsApp failed:", err?.message || err);
+        // ✅ فشل بدء التشغيل: فك القفل
+        isStarting = false;
+    }
 }
 
 // --- 🔥 دالة الرياكشن الذكية (Smart Reaction Engine) 🔥 ---
@@ -243,11 +278,11 @@ async function executeSmartReaction(chatId, messageId, reaction, participant = n
     if (!sock) return;
 
     const targetChatId = getJid(chatId);
-    
-    const key = { 
-        remoteJid: targetChatId, 
-        id: messageId, 
-        fromMe: false 
+
+    const key = {
+        remoteJid: targetChatId,
+        id: messageId,
+        fromMe: false
     };
 
     if (targetChatId.endsWith('@g.us')) {
@@ -284,6 +319,11 @@ app.get('/qr-code', (req, res) => {
 
 app.post('/send-message', async (req, res) => {
     const { phone, message, reply_id } = req.body;
+
+    if (!message) return res.status(400).json({ error: "No message" });
+    if (!isWaConnected) return res.status(503).json({ error: "WhatsApp disconnected" });
+    if (!sock) return res.status(503).json({ error: "WhatsApp not initialized" });
+
     try {
         const chatId = reply_id ? getJid(reply_id) : getJid(phone);
         console.log(`📤 [SEND] To: ${cleanId(chatId)}`);
@@ -291,7 +331,7 @@ app.post('/send-message', async (req, res) => {
         res.json({ status: 'success' });
     } catch (e) {
         console.error(`❌ Send Error: ${e.message}`);
-        res.json({ status: 'error', error: e.message });
+        res.status(500).json({ status: 'error', error: e.message });
     }
 });
 
@@ -299,7 +339,8 @@ app.post('/send-reaction', async (req, res) => {
     const { chat_id, message_id, reaction, participant } = req.body;
 
     if (!chat_id || !message_id) return res.status(400).json({ error: "Missing fields" });
-    if (!sock?.ws?.isOpen) return res.status(503).json({ error: "WhatsApp disconnected" });
+    if (!isWaConnected) return res.status(503).json({ error: "WhatsApp disconnected" });
+    if (!sock) return res.status(503).json({ error: "WhatsApp not initialized" });
 
     res.json({ status: 'queued' });
     executeSmartReaction(chat_id, message_id, reaction, participant);
@@ -310,7 +351,7 @@ app.post('/kick-member', async (req, res) => {
     try {
         const groupJid = getJid(group_id);
         const targetJid = target_lid ? getJid(target_lid) : getJid(phone);
-        
+
         if (groupJid && targetJid) {
             console.log(`🔨 [KICK] ${cleanId(targetJid)} from ${cleanId(groupJid)}`);
             await sock.groupParticipantsUpdate(groupJid, [targetJid], "remove");
@@ -325,7 +366,7 @@ app.post('/kick-member', async (req, res) => {
 
 // تشغيل السيرفر
 startWhatsApp();
-app.listen(PORT, () => console.log(`🚀 Baileys Bridge Running on ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Baileys Bridge Running on 0.0.0.0:${PORT}`));
 
 /**
  * TaxiHon WhatsApp Bridge - Baileys Replica Version
