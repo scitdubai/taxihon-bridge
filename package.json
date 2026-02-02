@@ -2,10 +2,10 @@
   "name": "wa-bridge",
   "version": "1.0.0",
   "description": "TaxiHon WhatsApp Bridge with Baileys",
-  "main": "serverb.js",
+  "main": "server.cjs",
   "type": "module",
   "scripts": {
-    "start": "node serverb.js"
+    "start": "node server.cjs"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.6.0",
