@@ -51,19 +51,46 @@ async function processQueue() {
 }
 
 async function sendToDjango(payload, msgKey = null) {
-    axios.post(DJANGO_WEBHOOK_URL, payload, { timeout: 10000 })
-        .then(async (response) => {
-            // ✅ معالجة الرياكشن الفوري القادم من جانغو
-            if (response.data && response.data.reaction && msgKey) {
-                await executeSmartReaction(msgKey.remoteJid, msgKey.id, response.data.reaction, msgKey.participant);
-            }
-        })
-        .catch(error => {
-            console.error(`❌ [Django Offline] Queuing ${payload.whatsapp_message_id}`);
-            pendingQueue.push({ payload });
-            if (!isRetrying) setTimeout(processQueue, 5000);
-        });
+  try {
+    const response = await axios.post(DJANGO_WEBHOOK_URL, payload, {
+      timeout: 10000,
+      headers: { "Content-Type": "application/json" },
+      validateStatus: () => true, // مهم جداً
+    });
+
+    // نجاح
+    if (response.status >= 200 && response.status < 300) {
+      if (response.data?.reaction && msgKey) {
+        await executeSmartReaction(
+          msgKey.remoteJid,
+          msgKey.id,
+          response.data.reaction,
+          msgKey.participant
+        );
+      }
+      return;
+    }
+
+    // ❌ جانغو رد بس فيه خطأ
+    console.error(
+      `❌ [DJANGO ERROR] HTTP ${response.status}`,
+      JSON.stringify(response.data)
+    );
+    return;
+
+  } catch (error) {
+    // ❌ خطأ شبكة حقيقي
+    console.error("❌ [NETWORK ERROR]", {
+      message: error.message,
+      code: error.code,
+      url: DJANGO_WEBHOOK_URL,
+    });
+
+    pendingQueue.push({ payload });
+    if (!isRetrying) setTimeout(processQueue, 5000);
+  }
 }
+
 
 // --- 🛠️ أدوات المعرفات (JID Helper) ---
 const getJid = (number) => {
