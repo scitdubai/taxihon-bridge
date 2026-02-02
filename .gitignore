@@ -4,3 +4,7 @@
 
 # 2. مجلد مكتبات Node.js
 node_modules/
+
+node_modules/
+baileys_auth_info/
+*.local
