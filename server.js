@@ -198,6 +198,7 @@ async function startWhatsApp() {
         });
 
         // استقبال الرسائل
+        // استقبال الرسائل
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             console.log("📩 Raw Message Received:", JSON.stringify(messages[0].key, null, 2));
             if (type !== 'notify') return;
@@ -206,33 +207,68 @@ async function startWhatsApp() {
                 try {
                     if (msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
 
-                    // --- استخراج البيانات ---
+                    // --- استخراج البيانات الأساسية ---
                     const remoteJid = msg.key.remoteJid;
                     const isGroup = remoteJid.endsWith('@g.us');
                     const senderId = cleanId(remoteJid);
-
-                    // 🔥 استخراج هوية المشارك بدقة (LID أو عادي)
                     const participantFull = msg.key.participant || null;
                     const authorId = participantFull ? cleanId(participantFull) : null;
 
+                    // فلترة البوتات والأدمن
                     if (ADMIN_BOT_NUMBERS.includes(senderId) || (authorId && ADMIN_BOT_NUMBERS.includes(authorId))) continue;
 
+                    // ============================================================
+                    // 1. معالجة التعديل والحذف (Protocol Messages) 🛠️
+                    // ============================================================
+                    if (msg.message?.protocolMessage) {
+                        const protocolMsg = msg.message.protocolMessage;
+                        const originalId = protocolMsg.key?.id; // 🔥 هذا هو المفتاح: آيدي الرسالة الأصلية
+
+                        // أ) حالة التعديل (EDIT - Type 14)
+                        if (protocolMsg.type === 14) {
+                            const newText = protocolMsg.editedMessage?.conversation || 
+                                          protocolMsg.editedMessage?.extendedTextMessage?.text || "";
+                            
+                            console.log(`✏️ [EDIT DETECTED] Target ID: ${originalId}`);
+                            
+                            await sendToDjango({
+                                event_type: 'message_edit',
+                                whatsapp_message_id: msg.key.id, // آيدي حدث التعديل نفسه
+                                target_message_id: originalId,   // 🔥 آيدي الرسالة التي نريد تعديلها
+                                message_text: newText,
+                                sender_id: senderId,
+                                group_id: isGroup ? remoteJid : null,
+                                is_group: isGroup
+                            }, msg.key);
+                            continue; // انتهينا من التعديل
+                        }
+                        
+                        // ب) حالة الحذف (REVOKE - Type 0)
+                        if (protocolMsg.type === 0) {
+                            console.log(`🗑️ [REVOKE DETECTED] Target ID: ${originalId}`);
+                            
+                            await sendToDjango({
+                                event_type: 'message_revoke',
+                                whatsapp_message_id: msg.key.id, 
+                                target_message_id: originalId,   // 🔥 آيدي الرسالة التي نريد حذفها
+                                sender_id: senderId,
+                                group_id: isGroup ? remoteJid : null,
+                                is_group: isGroup
+                            }, null); 
+                            continue; // انتهينا من الحذف
+                        }
+                    }
+
+                    // ============================================================
+                    // 2. معالجة الرسائل الجديدة (New Messages) 📩
+                    // ============================================================
                     const messageContent = msg.message;
                     if (!messageContent) continue;
 
-                    // التعامل مع التعديل
-                    if (messageContent.protocolMessage && messageContent.protocolMessage.type === 14) {
-                        const editedKey = messageContent.protocolMessage.key;
-                        const newText = messageContent.protocolMessage.editedMessage?.conversation || "";
-                        console.log(`✏️ [EDIT] ID: ${editedKey.id}`);
-                        sendToDjango({
-                            event_type: 'message_edit',
-                            whatsapp_message_id: editedKey.id,
-                            message_text: newText,
-                            sender_id: senderId
-                        });
-                        continue;
-                    }
+                    // 🔥🔥 (جديد) إعطاء الساعة الرملية فوراً لطمأنة المستخدم 🔥🔥
+                    await sock.sendMessage(remoteJid, { 
+                        react: { text: '⏳', key: msg.key } 
+                    });
 
                     // تحديد النوع والنص
                     const msgType = Object.keys(messageContent)[0];
@@ -240,7 +276,7 @@ async function startWhatsApp() {
                         messageContent.extendedTextMessage?.text ||
                         messageContent.imageMessage?.caption || "";
 
-                    // --- 🎨 اللوج المحترم ---
+                    // --- 🎨 اللوج ---
                     const typeIcon = (msgType === 'audioMessage' || msgType === 'pttMessage') ? '🎤' : (msgType === 'imageMessage' ? '🖼️' : '📄');
                     const lidTag = (participantFull && participantFull.includes('lid')) ? '(LID)' : '';
 
@@ -257,7 +293,7 @@ async function startWhatsApp() {
                         sender_id: senderId,
                         group_id: isGroup ? remoteJid : null,
                         author_id: authorId,
-                        participant_raw: participantFull, // 🔥 المعرف الخام للرياكشن
+                        participant_raw: participantFull,
                         is_group: isGroup,
                         message_text: body,
                         has_media: false
