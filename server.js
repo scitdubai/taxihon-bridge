@@ -1,838 +1,586 @@
 /**
- * TaxiHon WhatsApp Bridge - Baileys Ultimate Edition 🚀
- * Fixes: ERR_REQUIRE_ESM (Dynamic Import Implemented)
+ * TaxiHon Bridge - Diamond Edition 💎 (High Load Optimized)
+ * Status: FINAL PRODUCTION READY
+ * Features:
+ * 1. 🛡️ Crash-Proof & Memory Safe.
+ * 2. ⚡ Smart Reaction Queue.
+ * 3. 🗓️ 32-Day Rolling Window (Accounting Mode).
+ * 4. 🚀 Async Saving (Non-blocking I/O).
  */
 
-import express from "express";
-import axios from "axios";
-import qrcodeTerminal from "qrcode-terminal";
-import pino from "pino";
+import { 
+    default as makeWASocket, 
+    useMultiFileAuthState, 
+    DisconnectReason, 
+    fetchLatestBaileysVersion, 
+    downloadMediaMessage,
+    delay,
+    makeCacheableSignalKeyStore
+} from '@whiskeysockets/baileys';
 
-process.on("unhandledRejection", (r) => console.error("❌ UNHANDLED REJECTION:", r));
-process.on("uncaughtException", (e) => console.error("❌ UNCAUGHT EXCEPTION:", e));
+import pino from 'pino';
+import express from 'express';
+import axios from 'axios';
+import qrcodeTerminal from 'qrcode-terminal';
+import fs from 'fs';
+import cors from 'cors';
 
-const app = express();
-app.use(express.json({ limit: '50mb' }));
-
-// --- الإعدادات ---
-const PORT = process.env.PORT || 3000;
-const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://127.0.0.1:8000/webhook/';
+const PORT = 3000;
+const DJANGO_WEBHOOK_URL = 'http://127.0.0.1:8000/webhook/'; 
+const SESSION_DIR = 'auth_info_baileys'; 
+const STORE_FILE = 'baileys_store.json'; 
 const ADMIN_BOT_NUMBERS = ['963931698698', '963931697697'];
 
-let sock;
-let currentQrCode = null;
-let isWaConnected = false;
-let isStarting = false;
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
 
-// --- 🔥 نظام الطابور (Queue System) 🔥 ---
-let pendingQueue = [];
-let isRetrying = false;
+// --- 🔥 إعدادات الذاكرة الزمنية ---
+const MAX_DAYS_RETENTION = 32; // الاحتفاظ بآخر 32 يوم
+const MAX_MESSAGES_LIMIT = 100000; // سقف أمان عالٍ جداً
+const SAVE_INTERVAL_MS = 5 * 60 * 1000; // الحفظ كل 5 دقائق
 
-async function processQueue() {
-    if (isRetrying || pendingQueue.length === 0) return;
-    isRetrying = true;
+// --- 🔥 المخزن الذكي (Smart Store) ---
+const store = {
+    messages: {}, 
+    isSaving: false,
 
-    console.log(`🔄 [Queue] Retrying ${pendingQueue.length} messages...`);
-    const currentBatch = [...pendingQueue];
-    pendingQueue = [];
-
-    // إرسال متوازي لزيادة السرعة
-    await Promise.all(currentBatch.map(async (item) => {
+    readFromFile: () => {
         try {
-            await axios.post(DJANGO_WEBHOOK_URL, item.payload, { timeout: 5000 });
-            console.log(`✅ [Recovered] ${item.payload.whatsapp_message_id} sent.`);
-        } catch (error) {
-            pendingQueue.push(item); // فشل؟ أعده للطابور
+            if (fs.existsSync(STORE_FILE)) {
+                const data = fs.readFileSync(STORE_FILE, 'utf-8');
+                store.messages = JSON.parse(data);
+                console.log(`📂 Loaded history for ${Object.keys(store.messages).length} chats.`);
+                store.cleanup(); 
+            }
+        } catch (e) { console.error("⚠️ Store load error:", e.message); }
+    },
+    
+    writeToFile: () => {
+        if (store.isSaving) return;
+        store.isSaving = true;
+        
+        console.log("💾 Saving data to disk...");
+        try {
+            const data = JSON.stringify(store.messages);
+            fs.writeFile(STORE_FILE, data, (err) => {
+                store.isSaving = false;
+                if (err) console.error("⚠️ Write Error:", err);
+                else console.log("✅ Data saved successfully.");
+            });
+        } catch (e) {
+            store.isSaving = false;
+            console.error("⚠️ Serialization Error:", e.message);
         }
-    }));
+    },
+    
+    // ✅ دالة التنظيف الذكية (تزيل التكرار وتحافظ على المجال الزمني)
+    cleanup: () => {
+        const cutoff = (Date.now() / 1000) - (MAX_DAYS_RETENTION * 24 * 60 * 60);
+        let cleanedCount = 0;
 
-    isRetrying = false;
-    if (pendingQueue.length > 0) setTimeout(processQueue, 5000);
-}
+        for (const jid in store.messages) {
+            const initialLen = store.messages[jid].length;
 
-async function sendToDjango(payload, msgKey = null) {
-  try {
-    const response = await axios.post(DJANGO_WEBHOOK_URL, payload, {
-      timeout: 10000,
-      headers: { "Content-Type": "application/json" },
-      validateStatus: () => true, // مهم جداً
-    });
+            // 1. إزالة التكرار (Deduplication) - أهم خطوة لضمان دقة البيانات
+            // نستخدم Map للاحتفاظ بنسخة واحدة فقط من كل رسالة بناءً على ID
+            const uniqueMap = new Map();
+            store.messages[jid].forEach(m => {
+                if (m.key && m.key.id) uniqueMap.set(m.key.id, m);
+            });
+            store.messages[jid] = Array.from(uniqueMap.values());
 
-    // نجاح
-    if (response.status >= 200 && response.status < 300) {
-      if (response.data?.reaction && msgKey) {
-        await executeSmartReaction(
-          msgKey.remoteJid,
-          msgKey.id,
-          response.data.reaction,
-          msgKey.participant
-        );
-      }
-      return;
+            // 2. الفلترة الزمنية (32 يوم)
+            store.messages[jid] = store.messages[jid].filter(m => {
+                const t = m.messageTimestamp || 0;
+                return t >= cutoff;
+            });
+
+            // 3. الترتيب الزمني (الأقدم أولاً -> الأحدث آخراً)
+            store.messages[jid].sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
+
+            // 4. سقف الأمان (فقط للطوارئ)
+            if (store.messages[jid].length > MAX_MESSAGES_LIMIT) {
+                // نحتفظ بآخر 100 ألف رسالة (الأحدث)
+                store.messages[jid] = store.messages[jid].slice(-MAX_MESSAGES_LIMIT);
+            }
+
+            cleanedCount += (initialLen - store.messages[jid].length);
+        }
+        
+        if (cleanedCount > 0) {
+            console.log(`🧹 [Cleanup] Optimized store. Removed/Deduped: ${cleanedCount} msgs.`);
+        }
+    },
+
+    // ✅ دالة الإضافة السريعة (بدون فحص تكرار لإلتقاط الدفعات الكبيرة)
+    upsertMessage: (msg) => {
+        if (!msg || !msg.key) return; 
+        const jid = msg.key.remoteJid;
+        if (!jid) return; 
+
+        if (!store.messages[jid]) store.messages[jid] = [];
+        
+        // نضيف الرسالة فوراً للذاكرة (حتى لو مكررة مؤقتاً)
+        // سيقوم الـ cleanup بعد 5 دقائق بإزالة التكرار وترتيبها
+        store.messages[jid].push(msg);
+    },
+
+    loadHistory: (chats) => {
+        if (!chats) return;
+        let count = 0;
+        for (const chat of chats) {
+            if (chat.messages) {
+                for (const msg of chat.messages) {
+                    const messageObj = msg.message ? msg : (msg.messageStubType ? null : msg);
+                    if (messageObj) {
+                        store.upsertMessage(messageObj);
+                        count++;
+                    }
+                }
+            }
+        }
+        console.log(`📚 Imported ${count} messages.`);
     }
+};
 
-    // ❌ جانغو رد بس فيه خطأ
-    console.error(
-      `❌ [DJANGO ERROR] HTTP ${response.status}`,
-      JSON.stringify(response.data)
-    );
-    return;
+// تشغيل القراءة عند البدء
+store.readFromFile();
 
-  } catch (error) {
-    // ❌ خطأ شبكة حقيقي
-    console.error("❌ [NETWORK ERROR]", {
-      message: error.message,
-      code: error.code,
-      url: DJANGO_WEBHOOK_URL,
-    });
+// دورة الحياة: تنظيف ثم حفظ كل 5 دقائق
+setInterval(() => {
+    store.cleanup();
+    store.writeToFile();
+}, SAVE_INTERVAL_MS);
 
-    pendingQueue.push({ payload });
-    if (!isRetrying) setTimeout(processQueue, 5000);
-  }
-}
+// حفظ الطوارئ
+process.on('SIGINT', () => { 
+    try { fs.writeFileSync(STORE_FILE, JSON.stringify(store.messages)); } catch(e){}
+    process.exit(); 
+});
 
+// --- 🧠 2. إدارة الطوابير ---
+let sock;
+let isWaConnected = false;
+let messageQueue = []; 
+let reactionQueue = []; 
+let isProcessingReactions = false;
 
-// --- 🛠️ أدوات المعرفات (JID Helper) ---
+// --- Helpers ---
 const getJid = (number) => {
     if (!number) return null;
     let clean = String(number).replace(/\D/g, '');
-
     if (String(number).includes('@')) return number;
     if (clean.length < 5) return null;
-
-    // 1. المجموعات
-    if (clean.length >= 18 && clean.startsWith('1203')) return `${clean}@g.us`;
-
-    // 2. LIDs (تصحيح الطول ليشمل 15 خانة)
-    if (clean.length >= 15 && !clean.startsWith('963')) return `${clean}@lid`;
-
-    // 3. أرقام عادية
     if (clean.startsWith('09')) clean = '963' + clean.substring(1);
-
     return `${clean}@s.whatsapp.net`;
 };
 
-function cleanId(jid) {
-    if (!jid) return null;
-    return jid.split('@')[0].split(':')[0];
+const cleanId = (jid) => jid ? jid.split('@')[0].split(':')[0] : null;
+const extractPhoneNumber = (jid) => jid ? jid.split('@')[0].split(':')[0] : null;
+
+// --- 🚦 3. معالجات الطوابير ---
+const processMessageQueue = async () => {
+    if (messageQueue.length === 0) return;
+    const batch = [...messageQueue];
+    messageQueue = [];
+    for (const item of batch) {
+        try {
+            await sendToDjango(item.payload, item.key);
+        } catch (e) {
+            messageQueue.push(item);
+        }
+    }
+};
+
+const processReactionQueue = async () => {
+    if (isProcessingReactions || reactionQueue.length === 0) return;
+    isProcessingReactions = true;
+    while (reactionQueue.length > 0) {
+        const item = reactionQueue.shift();
+        if (sock && isWaConnected) {
+            try {
+                await sock.sendMessage(item.chatId, { react: { text: item.reaction, key: item.key } });
+                await delay(600);
+            } catch (e) { console.error("React Error:", e.message); }
+        }
+    }
+    isProcessingReactions = false;
+};
+
+// --- 🌐 4. الإرسال للباك إند ---
+async function sendToDjango(payload, msgKey = null) {
+    try {
+        const response = await axios.post(DJANGO_WEBHOOK_URL, payload, { timeout: 10000 });
+        
+        if (response.status >= 200 && response.status < 300) {
+            if (!payload.is_sync && response.data?.reaction && msgKey) {
+                reactionQueue.push({
+                    chatId: msgKey.remoteJid,
+                    reaction: response.data.reaction,
+                    key: msgKey
+                });
+                processReactionQueue();
+            }
+        }
+    } catch (error) {
+        console.error(`❌ [Django Error] ${error.message}`);
+        if (!error.response && !payload.is_sync) { 
+            messageQueue.push({ payload, key: msgKey });
+            setTimeout(processMessageQueue, 5000);
+        }
+    }
 }
 
-// --- 🚀 تشغيل الواتساب (Baileys Engine) ---
+// --- 🔌 5. الاتصال الرئيسي ---
 async function startWhatsApp() {
-    // ✅ قفل يمنع تشغيل startWhatsApp مرتين بنفس الوقت
-    if (isStarting) {
-        console.log("⏳ startWhatsApp skipped (already starting)...");
-        return;
-    }
-    isStarting = true;
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+    const { version } = await fetchLatestBaileysVersion();
 
-    try {
-        // 🔥 التعديل هنا: استيراد ديناميكي (Dynamic Import) لحل مشكلة ESM
-        const {
-            default: makeWASocket,
-            useMultiFileAuthState,
-            DisconnectReason,
-            fetchLatestBaileysVersion,
-            downloadMediaMessage
-        } = await import('@whiskeysockets/baileys');
+    console.log(`🚀 Starting Bridge v${version.join('.')} on Port ${PORT}`);
 
-        const { Boom } = await import('@hapi/boom');
+    sock = makeWASocket({
+        version,
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: false,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" })),
+        },
+        generateHighQualityLinkPreview: true,
+        browser: ["Ubuntu", "Chrome", "20.0.04"], 
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 10000,
+        syncFullHistory: true, 
+        markOnlineOnConnect: true,
+    });
 
-        const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
-        const { version } = await fetchLatestBaileysVersion();
+    sock.ev.on('creds.update', saveCreds);
 
-        console.log(`⏳ Starting WhatsApp Client (v${version.join('.')})...`);
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        
+        if (qr) {
+            console.log('\n🔵 Scan QR Code:\n');
+            qrcodeTerminal.generate(qr, { small: true });
+        }
 
-        sock = makeWASocket({
-            version,
-            auth: state,
-            printQRInTerminal: false, // سنطبعه يدوياً
-            logger: pino({ level: 'silent' }),
-            browser: ["TaxiHon", "Chrome", "1.0.0"],
-            syncFullHistory: false,
-            connectTimeoutMs: 60000,
-            retryRequestDelayMs: 2000,
-            markOnlineOnConnect: true
-        });
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log('⚠️ Reconnecting:', shouldReconnect);
+            if (shouldReconnect) setTimeout(startWhatsApp, 2000);
+        } else if (connection === 'open') {
+            console.log('✅ WhatsApp Connected Successfully!');
+            isWaConnected = true;
+            if (messageQueue.length > 0) processMessageQueue();
+        }
+    });
 
-        sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('messaging-history.set', async ({ chats, messages }) => {
+        console.log(`📥 [History Event] Received bulk data...`);
+        if (chats) store.loadHistory(chats); 
+        if (messages) {
+             for (const msg of messages) store.upsertMessage(msg.message ? msg : msg);
+             store.writeToFile(); // حفظ أولي
+             console.log(`📚 [History] Direct messages saved: ${messages.length}`);
+        }
+    });
 
-        // إدارة الاتصال
-        sock.ev.on('connection.update', (update) => {
-            const { connection, lastDisconnect, qr } = update;
-            isWaConnected = connection === 'open';
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        for (const msg of messages) {
+            store.upsertMessage(msg);
+        }
 
-            if (qr) {
-                currentQrCode = qr;
-                qrcodeTerminal.generate(qr, { small: true });
-                console.log(`🔗 QR URL: http://localhost:${PORT}/qr-code`);
-            }
-
-            if (connection === 'close') {
-                // ✅ حماية: lastDisconnect قد يكون undefined
-                const err = lastDisconnect?.error;
-
-                const shouldReconnect = (err instanceof Boom)
-                    ? err.output.statusCode !== DisconnectReason.loggedOut
-                    : true;
-
-                console.error(`❌ Disconnected! Reconnecting: ${shouldReconnect}`);
-
-                if (shouldReconnect) {
-                    // ✅ مهم جداً: فك القفل قبل إعادة التشغيل
-                    isStarting = false;
-                    startWhatsApp();
-                } else {
-                    // Logged out: خلي القفل مفكوك حتى تقدر تعمل start لاحقاً بعد تنظيف auth مثلاً
-                    isStarting = false;
-                }
-            } else if (connection === 'open') {
-                console.log('✅ WhatsApp Bridge Ready!');
-                currentQrCode = null;
-
-                // ✅ نجاح: فك القفل
-                isStarting = false;
-
-                if (pendingQueue.length > 0) processQueue();
-            }
-        });
-
-        // استقبال الرسائل
-        // استقبال الرسائل
-        sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            console.log("📩 Raw Message Received:", JSON.stringify(messages[0].key, null, 2));
-            if (type !== 'notify') return;
-
+        if (type === 'notify') {
             for (const msg of messages) {
                 try {
                     if (msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
+                    await processSingleMessage(msg, false); 
+                } catch (err) {}
+            }
+        } 
+        else if (type === 'append') {
+            console.log(`📥 [Append] Archived ${messages.length} older messages.`);
+            // لا نحفظ فوراً هنا، نترك الحفظ الدوري يتولى الأمر لتخفيف الضغط
+        }
+    });
+}
 
-                    // --- استخراج البيانات الأساسية ---
-                    const remoteJid = msg.key.remoteJid;
-                    const isGroup = remoteJid.endsWith('@g.us');
-                    const senderId = cleanId(remoteJid);
-                    const participantFull = msg.key.participant || null;
-                    const authorId = participantFull ? cleanId(participantFull) : null;
+// --- 📨 6. معالج الرسالة ---
+async function processSingleMessage(msg, isSync = false) {
+    const remoteJid = msg.key.remoteJid;
+    const isGroup = remoteJid.endsWith('@g.us');
+    const senderId = cleanId(remoteJid);
+    const participant = msg.key.participant || remoteJid;
 
-                    // فلترة البوتات والأدمن
-                    if (ADMIN_BOT_NUMBERS.includes(senderId) || (authorId && ADMIN_BOT_NUMBERS.includes(authorId))) continue;
+    if (ADMIN_BOT_NUMBERS.includes(senderId)) return;
 
-                    // ============================================================
-                    // 1. معالجة التعديل والحذف (Protocol Messages) 🛠️
-                    // ============================================================
-                    if (msg.message?.protocolMessage) {
-                        const protocolMsg = msg.message.protocolMessage;
-                        const originalId = protocolMsg.key?.id; // 🔥 هذا هو المفتاح: آيدي الرسالة الأصلية
+    const messageContent = msg.message;
+    if (!messageContent) return; 
 
-                        // أ) حالة التعديل (EDIT - Type 14)
-                        if (protocolMsg.type === 14) {
-                            const newText = protocolMsg.editedMessage?.conversation || 
-                                          protocolMsg.editedMessage?.extendedTextMessage?.text || "";
-                            
-                            console.log(`✏️ [EDIT DETECTED] Target ID: ${originalId}`);
-                            
-                            await sendToDjango({
-                                event_type: 'message_edit',
-                                whatsapp_message_id: msg.key.id, // آيدي حدث التعديل نفسه
-                                target_message_id: originalId,   // 🔥 آيدي الرسالة التي نريد تعديلها
-                                message_text: newText,
-                                sender_id: senderId,
-                                group_id: isGroup ? remoteJid : null,
-                                is_group: isGroup
-                            }, msg.key);
-                            continue; // انتهينا من التعديل
-                        }
-                        
-                        // ب) حالة الحذف (REVOKE - Type 0)
-                        if (protocolMsg.type === 0) {
-                            console.log(`🗑️ [REVOKE DETECTED] Target ID: ${originalId}`);
-                            
-                            await sendToDjango({
-                                event_type: 'message_revoke',
-                                whatsapp_message_id: msg.key.id, 
-                                target_message_id: originalId,   // 🔥 آيدي الرسالة التي نريد حذفها
-                                sender_id: senderId,
-                                group_id: isGroup ? remoteJid : null,
-                                is_group: isGroup
-                            }, null); 
-                            continue; // انتهينا من الحذف
-                        }
-                    }
+    let body = messageContent.conversation || 
+               messageContent.extendedTextMessage?.text || 
+               messageContent.imageMessage?.caption || "";
+    
+    if (isSync) {
+        if (!body || body.trim().length === 0) return;
+        else console.log(`✅ [SYNC] ${new Date(msg.messageTimestamp*1000).toLocaleDateString()} | ${body.substring(0, 30)}...`);
+    }
 
-                    // ============================================================
-                    // 2. معالجة الرسائل الجديدة (New Messages) 📩
-                    // ============================================================
-                    const messageContent = msg.message;
-                    if (!messageContent) continue;
+    if (!body || body.trim().length === 0) return;
 
-                    // 🔥🔥 (جديد) إعطاء الساعة الرملية فوراً لطمأنة المستخدم 🔥🔥
-                    await sock.sendMessage(remoteJid, { 
-                        react: { text: '⏳', key: msg.key } 
-                    });
+    const msgType = Object.keys(messageContent)[0];
 
-                    // تحديد النوع والنص
-                    const msgType = Object.keys(messageContent)[0];
-                    let body = messageContent.conversation ||
-                        messageContent.extendedTextMessage?.text ||
-                        messageContent.imageMessage?.caption || "";
+    let payload = {
+        event_type: 'new_message',
+        is_sync: isSync, 
+        whatsapp_message_id: msg.key.id,
+        sender_id: senderId,
+        participant_phone: extractPhoneNumber(participant),
+        participant_raw: participant,
+        group_id: isGroup ? remoteJid : null,
+        author_id: isGroup ? participant : null,
+        is_group: isGroup,
+        message_text: body,
+        timestamp: msg.messageTimestamp,
+        pushName: msg.pushName
+    };
 
-                    // --- 🎨 اللوج ---
-                    const typeIcon = (msgType === 'audioMessage' || msgType === 'pttMessage') ? '🎤' : (msgType === 'imageMessage' ? '🖼️' : '📄');
-                    const lidTag = (participantFull && participantFull.includes('lid')) ? '(LID)' : '';
+    if (['imageMessage', 'audioMessage', 'videoMessage', 'pttMessage'].includes(msgType)) {
+        try {
+            const buffer = await downloadMediaMessage(
+                msg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+            );
+            if (buffer) {
+                payload.has_media = true;
+                payload.media_data = buffer.toString('base64');
+                if (!body || body === "") payload.message_text = `[MEDIA: ${msgType}]`;
+            }
+        } catch (e) {}
+    }
 
-                    if (isGroup) {
-                        console.log(`📢 [GP] ${senderId} | 👤 ${authorId} ${lidTag} | ${typeIcon}`);
-                    } else {
-                        console.log(`📩 [DM] ${senderId} | ${typeIcon}`);
-                    }
+    if (!isSync) console.log(`📤 Live Msg: ${msg.key.id}`);
+    await sendToDjango(payload, msg.key);
+}
 
-                    // بناء البايلود
-                    let payload = {
-                        event_type: 'new_message',
-                        whatsapp_message_id: msg.key.id,
-                        sender_id: senderId,
-                        group_id: isGroup ? remoteJid : null,
-                        author_id: authorId,
-                        participant_raw: participantFull,
-                        is_group: isGroup,
-                        message_text: body,
-                        has_media: false
-                    };
+// --- 🔌 7. الروابط الخارجية ---
+// أ) المزامنة القسرية (مع فلتر التاريخ + فلتر الحذف الذكي 🗑️)
+app.post('/force-sync', async (req, res) => {
+    const { phone, limit, startDate, endDate } = req.body;
+    
+    try {
+        const jid = getJid(phone);
+        const messages = store.messages[jid]; 
 
-                    // معالجة الموقع
-                    if (msgType === 'locationMessage') {
-                        const loc = messageContent.locationMessage;
-                        payload.location = { lat: loc.degreesLatitude, lng: loc.degreesLongitude };
-                        payload.message_text = `GPS: ${loc.degreesLatitude},${loc.degreesLongitude}`;
-                    }
+        const totalAvailable = messages ? messages.length : 0;
+        console.log(`🧐 [DEBUG] RAM Messages: ${totalAvailable}`);
 
-                    // معالجة الميديا
-                    if (['imageMessage', 'audioMessage', 'videoMessage'].includes(msgType)) {
-                        try {
-                            const buffer = await downloadMediaMessage(
-                                msg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
-                            );
-                            if (buffer) {
-                                payload.has_media = true;
-                                payload.media_data = buffer.toString('base64');
-                                payload.media_type = msgType === 'audioMessage' ? 'audio/ogg' : 'image/jpeg';
-                                if (msgType === 'audioMessage') payload.message_text = "";
-                            }
-                        } catch (e) { console.error('⚠️ Media Download Skipped'); }
-                    }
+        if (!messages || totalAvailable === 0) {
+            return res.json({ status: "empty", message: "الأرشيف فارغ." });
+        }
 
-                    sendToDjango(payload, msg.key);
-
-                } catch (err) {
-                    console.error("Processing Error:", err.message);
+        // --- 🗑️ 1. بناء قائمة المحذوفات (Blacklist) ---
+        // نقوم بمسح كامل الرسائل للبحث عن أوامر الحذف (Revoke)
+        const revokedIds = new Set();
+        messages.forEach(msg => {
+            const proto = msg.message?.protocolMessage;
+            // Baileys: نوع REVOKE عادة يكون 0
+            if (proto && (proto.type === 'REVOKE' || proto.type === 0)) {
+                if (proto.key && proto.key.id) {
+                    revokedIds.add(proto.key.id);
                 }
             }
         });
-
-    } catch (err) {
-        console.error("❌ startWhatsApp failed:", err?.message || err);
-        // ✅ فشل بدء التشغيل: فك القفل
-        isStarting = false;
-    }
-}
-
-// --- 🔥 دالة الرياكشن الذكية (Smart Reaction Engine) 🔥 ---
-async function executeSmartReaction(chatId, messageId, reaction, participant = null) {
-    if (!sock) return;
-
-    const targetChatId = getJid(chatId);
-
-    const key = {
-        remoteJid: targetChatId,
-        id: messageId,
-        fromMe: false
-    };
-
-    if (targetChatId.endsWith('@g.us')) {
-        if (participant) {
-            key.participant = getJid(participant);
-        } else {
-            console.warn(`⚠️ [Reaction Warning] Missing participant for group msg ${messageId}. Reaction might fail.`);
+        
+        if (revokedIds.size > 0) {
+            console.log(`🧹 [Smart Filter] Found ${revokedIds.size} deleted messages. They will be ignored.`);
         }
-    }
 
-    try {
-        console.log(`🔍 [Reacting] ${cleanId(targetChatId)} -> Msg: ${messageId} | User: ${cleanId(key.participant) || 'Direct'}`);
-        await sock.sendMessage(targetChatId, {
-            react: { text: reaction || '✅', key: key }
+        // --- 2. الفلترة والتجهيز ---
+        let msgsToSync = messages.filter(m => {
+            // أ) استبعاد الرسالة إذا كانت هي نفسها أمر حذف (protocolMessage)
+            if (m.message?.protocolMessage) return false;
+
+            // ب) استبعاد الرسالة إذا كان الـ ID الخاص بها موجود في قائمة المحذوفات
+            if (m.key && revokedIds.has(m.key.id)) return false;
+
+            // ج) فلتر التاريخ (إذا وجد)
+            if (startDate) {
+                const startTimestamp = new Date(startDate).getTime() / 1000;
+                let endTimestamp = Infinity;
+                if (endDate) {
+                    endTimestamp = (new Date(endDate).getTime() / 1000) + 86400; // نهاية اليوم + 24 ساعة
+                }
+                const t = m.messageTimestamp || 0;
+                return t >= startTimestamp && t <= endTimestamp;
+            }
+            
+            return true;
         });
-        console.log(`✅ [REACT DONE]`);
+
+        // تطبيق الـ Limit (نأخذ آخر العدد المطلوب من الرسائل الصافية)
+        if (!startDate) {
+            const actualLimit = limit || 100;
+            msgsToSync = msgsToSync.slice(-actualLimit);
+        }
+
+        const totalCount = msgsToSync.length;
+        
+        if (totalCount === 0) {
+            return res.json({ status: "skipped", message: "لا توجد رسائل صالحة (قد تكون كلها محذوفة أو خارج التاريخ)." });
+        }
+        
+        res.json({ 
+            status: "started", 
+            message: `جاري معالجة ${totalCount} رسالة (بعد استبعاد المحذوف)...`, 
+            target_id: jid 
+        });
+
+        // --- 3. التنفيذ في الخلفية ---
+        (async () => {
+            console.log(`🔄 [Sync] Start sending ${totalCount} clean messages...`);
+            for (const msg of msgsToSync) {
+                try {
+                    // نرسل مع flag: true للمزامنة
+                    await processSingleMessage(msg, true);
+                    // تأخير بسيط جداً لمنع اختناق الشبكة
+                    await delay(10); 
+                } catch (err) { console.error("Sync msg error:", err.message); }
+            }
+            console.log(`✅ [Sync] Done.`);
+        })();
+
     } catch (e) {
-        console.error(`❌ [REACT FAILED] ${e.message}`);
-    }
-}
-
-// --- API Endpoints ---
-
-app.get("/health", (req, res) => res.json({ status: "ok" }));
-
-app.get('/qr-code', (req, res) => {
-    if (currentQrCode) {
-        const url = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(currentQrCode)}`;
-        res.send(`<html><body style="text-align:center;"><img src="${url}"/><br>Scan me!</body></html>`);
-    } else {
-        res.send("✅ Connected");
+        console.error("Force Sync Error:", e);
+        if (!res.headersSent) res.status(500).json({ error: e.message });
     }
 });
 
+// ب) ماسح الأشباح (Scan Revoked) 👻
+app.post('/scan-revoked', async (req, res) => {
+    const { phone } = req.body;
+    const jid = getJid(phone);
+    const messages = store.messages[jid];
+
+    if (!messages) return res.json({ status: "empty", ids: [] });
+
+    // البحث عن كل رسائل الحذف في أرشيف الهاتف
+    const revokedIds = new Set();
+    messages.forEach(msg => {
+        const proto = msg.message?.protocolMessage;
+        if (proto && (proto.type === 'REVOKE' || proto.type === 0)) {
+            if (proto.key && proto.key.id) {
+                revokedIds.add(proto.key.id);
+            }
+        }
+    });
+
+    console.log(`👻 [Ghost Scanner] Found ${revokedIds.size} deletion requests in WhatsApp history.`);
+    
+    // إرسال القائمة للباك إند ليطابقها مع الموجود
+    res.json({ 
+        status: "success", 
+        count: revokedIds.size, 
+        ids: Array.from(revokedIds) 
+    });
+});
+// أ) المزامنة القسرية (مع فلتر التاريخ)
+// app.post('/force-sync', async (req, res) => {
+//     const { phone, limit, startDate, endDate } = req.body;
+    
+//     try {
+//         const jid = getJid(phone);
+//         const messages = store.messages[jid]; 
+
+//         const totalAvailable = messages ? messages.length : 0;
+//         console.log(`🧐 [DEBUG] RAM Messages: ${totalAvailable}`);
+
+//         if (!messages || totalAvailable === 0) {
+//             return res.json({ status: "empty", message: "الأرشيف فارغ." });
+//         }
+
+//         let msgsToSync = [];
+        
+//         if (startDate) {
+//             const startTimestamp = new Date(startDate).getTime() / 1000;
+//             let endTimestamp = Infinity;
+//             if (endDate) {
+//                 endTimestamp = new Date(endDate).getTime() / 1000;
+//                 endTimestamp += 86400; 
+//             }
+
+//             console.log(`📅 [Filter] ${startDate} -> ${endDate || 'NOW'}`);
+            
+//             msgsToSync = messages.filter(m => {
+//                 const t = m.messageTimestamp || 0;
+//                 return t >= startTimestamp && t <= endTimestamp;
+//             });
+
+//             if (msgsToSync.length === 0 && totalAvailable > 0) {
+//                 const first = new Date((messages[0].messageTimestamp || 0) * 1000).toLocaleDateString();
+//                 const last = new Date((messages[messages.length-1].messageTimestamp || 0) * 1000).toLocaleDateString();
+//                 console.log(`⚠️ [Mismatch] RAM Range: [${first}] to [${last}]`);
+//             }
+
+//         } else {
+//             const actualLimit = limit || 100;
+//             msgsToSync = messages.slice(-actualLimit);
+//         }
+
+//         const totalCount = msgsToSync.length;
+        
+//         res.json({ 
+//             status: "started", 
+//             message: `جاري معالجة ${totalCount} رسالة...`, 
+//             target_id: jid 
+//         });
+
+//         (async () => {
+//             console.log(`🔄 [Sync] Start: ${totalCount}`);
+//             for (const msg of msgsToSync) {
+//                 try {
+//                     await processSingleMessage(msg, true);
+//                     await delay(5); 
+//                 } catch (err) { }
+//             }
+//             console.log(`✅ [Sync] Done.`);
+//         })();
+
+//     } catch (e) {
+//         if (!res.headersSent) res.status(500).json({ error: e.message });
+//     }
+// });
+
 app.post('/send-message', async (req, res) => {
-    const { phone, message, reply_id } = req.body;
-
-    if (!message) return res.status(400).json({ error: "No message" });
-    if (!isWaConnected) return res.status(503).json({ error: "WhatsApp disconnected" });
-    if (!sock) return res.status(503).json({ error: "WhatsApp not initialized" });
-
+    if (!sock || !isWaConnected) return res.status(503).json({ error: "Disconnected" });
     try {
-        const chatId = reply_id ? getJid(reply_id) : getJid(phone);
-        console.log(`📤 [SEND] To: ${cleanId(chatId)}`);
-        await sock.sendMessage(chatId, { text: message });
+        await sock.sendMessage(getJid(req.body.phone), { text: req.body.message });
         res.json({ status: 'success' });
-    } catch (e) {
-        console.error(`❌ Send Error: ${e.message}`);
-        res.status(500).json({ status: 'error', error: e.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/send-reaction', async (req, res) => {
-    const { chat_id, message_id, reaction, participant } = req.body;
-
-    if (!chat_id || !message_id) return res.status(400).json({ error: "Missing fields" });
-    if (!isWaConnected) return res.status(503).json({ error: "WhatsApp disconnected" });
-    if (!sock) return res.status(503).json({ error: "WhatsApp not initialized" });
-
+    if (!isWaConnected) return res.status(503).json({ error: "Disconnected" });
+    reactionQueue.push({
+        chatId: getJid(req.body.chat_id),
+        reaction: req.body.reaction,
+        key: { remoteJid: getJid(req.body.chat_id), id: req.body.message_id, fromMe: false }
+    });
+    processReactionQueue();
     res.json({ status: 'queued' });
-    executeSmartReaction(chat_id, message_id, reaction, participant);
 });
 
 app.post('/kick-member', async (req, res) => {
-    const { group_id, phone, target_lid } = req.body;
+    if (!sock) return res.status(503).json({ error: "Disconnected" });
     try {
-        const groupJid = getJid(group_id);
-        const targetJid = target_lid ? getJid(target_lid) : getJid(phone);
-
-        if (groupJid && targetJid) {
-            console.log(`🔨 [KICK] ${cleanId(targetJid)} from ${cleanId(groupJid)}`);
-            await sock.groupParticipantsUpdate(groupJid, [targetJid], "remove");
-            res.json({ status: 'success' });
-        } else {
-            res.status(400).json({ error: "Invalid IDs" });
-        }
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+        await sock.groupParticipantsUpdate(getJid(req.body.group_id), [getJid(req.body.phone)], "remove");
+        res.json({ status: 'success' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// تشغيل السيرفر
-startWhatsApp();
-app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Baileys Bridge Running on 0.0.0.0:${PORT}`));
+app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-/**
- * TaxiHon WhatsApp Bridge - Baileys Replica Version
- * Features:
- * - Exact Match of server.js Logic & Logging
- * - Retry Queue (Offline Support)
- * - LIDs Handling & Detection
- * - Auto-Reactions & Edits/Deletes Handling
- * - Group Info Extraction
-  */
-
-// process.on('unhandledRejection', (r) => console.error('❌ UNHANDLED REJECTION:', r));
-// process.on('uncaughtException', (e) => console.error('❌ UNCAUGHT EXCEPTION:', e));
-
-// const express = require('express');
-// const axios = require('axios');
-// const qrcodeTerminal = require('qrcode-terminal');
-// const pino = require('pino');
-// const fs = require('fs');
-
-// const app = express();
-// app.use(express.json({ limit: '50mb' }));
-
-// // إعداد البورت والرابط من البيئة
-// const PORT = process.env.PORT || 3000;
-// const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://127.0.0.1:8000/webhook/';
-// const ADMIN_BOT_NUMBERS = ['963931698698', '963931697697'];
-
-// // متغيرات عامة
-// let sock;
-// let currentQrCode = null;
-
-// // --- 🔥 نظام الطابور (Retry Queue) - مطابق للقديم تماماً ---
-// let pendingQueue = [];
-// let isRetrying = false;
-
-// async function processQueue() {
-//     if (isRetrying || pendingQueue.length === 0) return;
-//     isRetrying = true;
-
-//     console.log(`🔄 [Queue] Attempting to resend ${pendingQueue.length} pending messages...`);
-//     const currentBatch = [...pendingQueue];
-//     pendingQueue = [];
-
-//     for (const item of currentBatch) {
-//         try {
-//             await axios.post(DJANGO_WEBHOOK_URL, item.payload);
-//             console.log(`✅ [Recovered] Message from ${item.payload.sender_id} sent to Django.`);
-//         } catch (error) {
-//             console.warn(`⚠️ [Queue] Retry failed, requeuing...`);
-//             pendingQueue.push(item);
-//         }
-//     }
-//     isRetrying = false;
-//     if (pendingQueue.length > 0) setTimeout(processQueue, 10000);
-// }
-
-// async function sendToDjango(payload, msgKey = null) {
-//     try {
-//         const response = await axios.post(DJANGO_WEBHOOK_URL, payload);
-        
-//         // إذا طلب جانغو رياكشن في الرد المباشر
-//         if (response.data && response.data.reaction && msgKey) {
-//             try { 
-//                 await sock.sendMessage(msgKey.remoteJid, { react: { text: response.data.reaction, key: msgKey } }); 
-//             } catch (e) {}
-//         }
-
-//         if (pendingQueue.length > 0) processQueue();
-//     } catch (error) {
-//         console.error(`❌ [Django Offline] Queuing message...`);
-//         pendingQueue.push({ payload });
-//         if (!isRetrying) setTimeout(processQueue, 10000);
-//     }
-// }
-
-// // --- أدوات مساعدة ---
-// function cleanId(id) {
-//     if (!id) return null;
-//     return id.replace('@c.us', '').replace('@s.whatsapp.net', '').replace('@g.us', '').split(':')[0];
-// }
-
-// const getJid = (number) => {
-//     if (!number) return null;
-//     let clean = String(number).replace(/\D/g, '');
-//     if (clean.startsWith('09')) clean = '963' + clean.substring(1);
-//     // إذا الرقم طويل جداً فهو غالباً LID أو مجموعة، وإلا فهو رقم عادي
-//     return clean.length > 15 && !clean.includes('@') ? `${clean}@g.us` : (clean.includes('@') ? clean : `${clean}@s.whatsapp.net`);
-// };
-
-// // --- 🚀 المحرك الرئيسي (Baileys) ---
-// async function startWhatsApp() {
-//     // استيراد ديناميكي لتجنب مشاكل ESM
-//     const { 
-//         default: makeWASocket, 
-//         useMultiFileAuthState, 
-//         DisconnectReason, 
-//         fetchLatestBaileysVersion,
-//         downloadMediaMessage,
-//         jidNormalizedUser,
-//         proto
-//     } = await import('@whiskeysockets/baileys');
-//     const { Boom } = await import('@hapi/boom');
-
-//     const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
-//     const { version } = await fetchLatestBaileysVersion();
-
-//     console.log("⏳ Starting WhatsApp Client...");
-
-//     sock = makeWASocket({
-//         version,
-//         auth: state,
-//         printQRInTerminal: false, // سنطبع الـ QR يدوياً ليتطابق مع القديم
-//         logger: pino({ level: 'silent' }),
-//         browser: ["TaxiHon Bridge", "Chrome", "1.0.0"],
-//         syncFullHistory: false // لتسريع الإقلاع
-//     });
-
-//     sock.ev.on('creds.update', saveCreds);
-
-//     // --- أحداث الاتصال ---
-//     sock.ev.on('connection.update', (update) => {
-//         const { connection, lastDisconnect, qr } = update;
-        
-//         if (qr) {
-//             currentQrCode = qr;
-//             qrcodeTerminal.generate(qr, { small: true });
-//             console.log('--------------------------------------------------');
-//             console.log('⚠️ **SCAN REQUIRED** ⚠️');
-//             console.log(`🔗 Open this URL in your browser to scan: http://localhost:${PORT}/qr-code`);
-//             console.log('--------------------------------------------------');
-//         }
-        
-//         if (connection === 'close') {
-//             const shouldReconnect = (lastDisconnect.error instanceof Boom) ? 
-//                 lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut : true;
-//             console.error(`❌ Disconnected! Reason: ${lastDisconnect.error}. Waiting for reconnection...`);
-//             if (shouldReconnect) startWhatsApp();
-//         } else if (connection === 'open') {
-//             console.log('✅ WhatsApp Bridge Ready & Connected!');
-//             currentQrCode = null;
-//             console.log(`🚀 API Listening on http://localhost:${PORT}`);
-//             if (pendingQueue.length > 0) processQueue();
-//         }
-//     });
-
-//     // --- معالجة الرسائل والأحداث ---
-//     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-//         if (type !== 'notify') return;
-
-//         for (const msg of messages) {
-//             try {
-//                 // تجاهل رسائل البوت نفسه والستوري
-//                 if (msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
-
-//                 // --- معالجة التعديل والحذف (Protocol Messages) ---
-//                 // Baileys يرسل التعديل والحذف كرسائل من نوع protocolMessage
-//                 const protocolMsg = msg.message?.protocolMessage;
-//                 if (protocolMsg) {
-//                     // 1. حالة التعديل (EDIT)
-//                     if (protocolMsg.type === 14) { // REVOKE = 0, EPHEMERAL = 3, EDIT = 14
-//                         const originalId = protocolMsg.key.id;
-//                         const newText = protocolMsg.editedMessage?.conversation || protocolMsg.editedMessage?.extendedTextMessage?.text || "";
-                        
-//                         console.log(`✏️ [EDIT] From ${cleanId(msg.key.participant || msg.key.remoteJid)}`);
-//                         await sendToDjango({
-//                             event_type: 'message_edit',
-//                             whatsapp_message_id: originalId,
-//                             message_text: newText,
-//                             sender_id: cleanId(msg.key.remoteJid),
-//                             is_group: msg.key.remoteJid.endsWith('@g.us')
-//                         }, msg.key);
-//                         continue;
-//                     }
-                    
-//                     // 2. حالة الحذف (REVOKE)
-//                     if (protocolMsg.type === 0) {
-//                         console.log(`🗑️ [REVOKE] Message deleted`);
-//                         await sendToDjango({
-//                             event_type: 'message_revoke',
-//                             whatsapp_message_id: protocolMsg.key.id
-//                         }, null);
-//                         continue;
-//                     }
-//                 }
-
-//                 // --- معالجة الرسائل العادية ---
-//                 if (!msg.message) continue;
-
-//                 const senderFullId = msg.key.remoteJid;
-//                 const isGroup = senderFullId.endsWith('@g.us');
-//                 let chatNumber = cleanId(senderFullId);
-//                 let authorNumber = msg.key.participant ? cleanId(msg.key.participant) : null;
-
-//                 // فلترة أرقام الأدمن
-//                 if (ADMIN_BOT_NUMBERS.includes(chatNumber) || (authorNumber && ADMIN_BOT_NUMBERS.includes(authorNumber))) continue;
-
-//                 // استخراج بيانات المجموعة (الاسم)
-//                 let groupName = null;
-//                 let groupId = null;
-
-//                 if (isGroup) {
-//                     groupId = chatNumber;
-//                     try {
-//                         // نحاول جلب الاسم من الكاش أو الشبكة
-//                         const groupMetadata = await sock.groupMetadata(senderFullId);
-//                         groupName = groupMetadata.subject;
-//                         console.log(`🔍 [GROUP] "${groupName}" | ID: ${groupId}`);
-//                     } catch (e) { groupName = "Unknown"; }
-//                 }
-
-//                 // استخراج النص والميديا
-//                 const messageType = Object.keys(msg.message)[0];
-//                 let contentBody = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.imageMessage?.caption || "";
-                
-//                 // لوج مطابق للقديم
-//                 const typeIcon = (messageType === 'audioMessage' || messageType === 'pttMessage') ? '🎤' : (messageType === 'imageMessage' ? '🖼️' : '📄');
-//                 const logContent = contentBody.substring(0, 30).replace(/\n/g, ' ');
-
-//                 if (isGroup) {
-//                     console.log(`📢 [GP: ${groupName}] ${groupId} | 👤 ${authorNumber} | ${typeIcon} "${logContent}..."`);
-//                 } else {
-//                     console.log(`📩 [DM] ${chatNumber} | ${typeIcon} "${logContent}..."`);
-//                 }
-
-//                 let payload = {
-//                     event_type: 'new_message',
-//                     whatsapp_message_id: msg.key.id,
-//                     sender_id: chatNumber,
-//                     author_id: authorNumber,
-//                     reply_to_id: senderFullId,
-//                     is_group: isGroup,
-//                     group_name: groupName,
-//                     group_id: groupId,
-//                     type: messageType,
-//                     message_text: contentBody,
-//                     has_media: false
-//                 };
-
-//                 // معالجة الموقع
-//                 if (messageType === 'locationMessage') {
-//                     const loc = msg.message.locationMessage;
-//                     payload.location = { lat: loc.degreesLatitude, lng: loc.degreesLongitude };
-//                     payload.message_text = `GPS: ${loc.degreesLatitude},${loc.degreesLongitude}`;
-//                 }
-                
-//                 // معالجة الميديا (تحميلها وإرسالها base64)
-//                 const isMedia = messageType === 'imageMessage' || messageType === 'audioMessage' || messageType === 'videoMessage' || messageType === 'stickerMessage';
-//                 if (isMedia) {
-//                     try {
-//                         const buffer = await downloadMediaMessage(
-//                             msg,
-//                             'buffer',
-//                             { },
-//                             { 
-//                                 logger: pino({ level: 'silent' }),
-//                                 reuploadRequest: sock.updateMediaMessage
-//                             }
-//                         );
-//                         if (buffer) {
-//                             payload.has_media = true;
-//                             payload.media_data = buffer.toString('base64');
-                            
-//                             // تحديد النوع التقريبي
-//                             if (messageType === 'imageMessage') payload.media_type = 'image/jpeg';
-//                             else if (messageType === 'audioMessage') payload.media_type = 'audio/ogg'; // واتساب يستخدم ogg غالباً
-//                             else if (messageType === 'videoMessage') payload.media_type = 'video/mp4';
-                            
-//                             if (messageType === 'audioMessage' || messageType === 'pttMessage') payload.message_text = "";
-//                         }
-//                     } catch (e) { console.error('Media Error:', e.message); }
-//                 }
-
-//                 await sendToDjango(payload, msg.key);
-
-//             } catch (err) {
-//                 console.error("Error processing message:", err);
-//             }
-//         }
-//     });
-// }
-
-// // --- API Endpoints ---
-
-// // 1. فحص الصحة
-// app.get("/health", (req, res) => res.json({ status: "ok", service: "wa-bridge", uptime: process.uptime() }));
-
-// // 2. عرض الرمز
-// app.get('/qr-code', (req, res) => {
-//     if (currentQrCode) {
-//         const qrCodeDataUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(currentQrCode)}`;
-//         res.send(`
-//             <!DOCTYPE html>
-//             <html>
-//             <head><title>WhatsApp Scan</title></head>
-//             <body style="font-family: Arial, sans-serif; text-align: center; padding-top: 50px;">
-//                 <h1>⚠️ WhatsApp Scan Required</h1>
-//                 <p>Please scan this code using WhatsApp Settings -> Linked Devices.</p>
-//                 <img src="${qrCodeDataUrl}" alt="QR Code" style="border: 1px solid #ccc; padding: 10px;"/>
-//                 <p>Status: Scanning... Last Checked: ${new Date().toLocaleTimeString()}</p>
-//                 <script>setTimeout(() => window.location.reload(), 5000);</script>
-//             </body>
-//             </html>
-//         `);
-//     } else {
-//         res.status(200).send("✅ Bridge Connected. QR code not needed.");
-//     }
-// });
-
-// // 3. الطرد (LID Support)
-// app.post('/kick-member', async (req, res) => {
-//     const { group_id, phone, target_lid } = req.body;
-//     if (!group_id) return res.status(400).json({ error: "Missing group_id" });
-
-//     try {
-//         // تنسيق معرف المجموعة
-//         let chatGroupId = group_id.includes('@g.us') ? group_id : `${group_id}@g.us`;
-//         let idToRemove = null;
-
-//         // تحديد الهدف (الأولوية للـ LID)
-//         if (target_lid) {
-//             idToRemove = getJid(target_lid);
-//             console.log(`🎯 [KICK FAST] Using LID: ${idToRemove}`);
-//         } else if (phone) {
-//             idToRemove = getJid(phone);
-//         }
-
-//         if (idToRemove) {
-//             // تنفيذ الطرد في Baileys
-//             await sock.groupParticipantsUpdate(chatGroupId, [idToRemove], "remove");
-//             console.log(`👋 [KICK SUCCESS] Removed ${idToRemove}`);
-//             res.json({ status: 'success' });
-//         } else {
-//             res.status(404).json({ error: "User ID could not be determined" });
-//         }
-//     } catch (e) {
-//         console.error(`❌ Kick Error: ${e.message}`);
-//         res.status(500).json({ error: e.message });
-//     }
-// });
-
-// // 4. إرسال رسالة (مع LID Support)
-// app.post('/send-message', async (req, res) => {
-//     const { phone, message, reply_id } = req.body;
-//     if (!message) return res.status(400).json({ error: "No message" });
-
-//     try {
-//         let chatId = reply_id;
-
-//         if (!chatId) {
-//             chatId = getJid(phone);
-            
-//             // تحقق بسيط (في Baileys يمكننا التأكد من وجود الرقم عبر onWhatsApp)
-//             const exists = await sock.onWhatsApp(chatId);
-//             if (!exists || exists.length === 0) {
-//                  console.log(`❌ [SEND] Number not on WhatsApp: ${chatId}`);
-//                  // ملاحظة: نكمل الإرسال أحياناً لأن الفحص قد يفشل مع المجموعات
-//             }
-//         }
-
-//         console.log(`⏳ [SEND] To: ${chatId}`);
-//         await sock.sendMessage(chatId, { text: message });
-
-//         console.log(`📤 [SENT] Success`);
-//         return res.json({ status: 'success' });
-
-//     } catch (e) {
-//         console.error(`❌ Send Error (Ignored): ${e?.message || e}`);
-//         return res.json({ status: 'success', note: 'Sent with potential error' });
-//     }
-// });
-
-// // 5. إرسال الرياكشن
-// app.post('/send-reaction', async (req, res) => {
-//     const { chat_id, message_id, reaction } = req.body;
-
-//     console.log(`📥 [REACTION REQUEST] Msg: ${message_id} | Chat: ${chat_id}`);
-
-//     if (!chat_id || !message_id) {
-//         return res.status(400).json({ error: "Missing chat_id or message_id" });
-//     }
-
-//     try {
-//         let targetChatId = getJid(chat_id);
-//         console.log(`🔍 Sending Reaction to: ${targetChatId}`);
-
-//         // في Baileys الرياكشن هو رسالة خاصة تحتوي على المفتاح
-//         await sock.sendMessage(targetChatId, {
-//             react: {
-//                 text: reaction || '✅',
-//                 key: { remoteJid: targetChatId, id: message_id, fromMe: false } // نفترض أن الرسالة ليست منا
-//             }
-//         });
-
-//         console.log(`✅ [REACTION SUCCESS] Added to ${message_id}`);
-//         res.json({ status: 'success' });
-
-//     } catch (e) {
-//         console.error(`❌ Reaction Error: ${e.message}`);
-//         res.status(500).json({ error: e.message });
-//     }
-// });
-
-// // تشغيل التطبيق
-// startWhatsApp();
-// app.listen(PORT, () => console.log(`🚀 Bridge on ${PORT}`));
+(async () => {
+    await startWhatsApp();
+    app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Bridge Running on ${PORT}`));
+})();
