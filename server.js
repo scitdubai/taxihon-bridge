@@ -17,7 +17,7 @@ import {
     delay,
     makeCacheableSignalKeyStore
 } from '@whiskeysockets/baileys';
-
+import QRCode from 'qrcode';
 import pino from 'pino';
 import express from 'express';
 import axios from 'axios';
@@ -165,7 +165,7 @@ let isWaConnected = false;
 let messageQueue = []; 
 let reactionQueue = []; 
 let isProcessingReactions = false;
-
+let currentQR = null;
 // --- Helpers ---
 const getJid = (number) => {
     if (!number) return null;
@@ -261,6 +261,7 @@ async function startWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
         
         if (qr) {
+            currentQR = qr; // ✅ حفظ الرمز في المتغير لعرضه في المتصفح
             console.log('\n🔵 Scan QR Code:\n');
             qrcodeTerminal.generate(qr, { small: true });
         }
@@ -270,7 +271,8 @@ async function startWhatsApp() {
             console.log('⚠️ Reconnecting:', shouldReconnect);
             if (shouldReconnect) setTimeout(startWhatsApp, 2000);
         } else if (connection === 'open') {
-            console.log('✅ WhatsApp Connected Successfully!');
+           console.log('✅ WhatsApp Connected Successfully!');
+            currentQR = null; // ✅ تصفير الرمز عند الاتصال
             isWaConnected = true;
             if (messageQueue.length > 0) processMessageQueue();
         }
@@ -362,6 +364,45 @@ async function processSingleMessage(msg, isSync = false) {
     if (!isSync) console.log(`📤 Live Msg: ${msg.key.id}`);
     await sendToDjango(payload, msg.key);
 }
+
+// رابط عرض الـ QR Code في المتصفح
+app.get('/qr-code', async (req, res) => {
+    try {
+        if (isWaConnected) {
+            return res.send(`
+                <div style="font-family:sans-serif; text-align:center; padding-top:50px;">
+                    <h1 style="color:green;">✅ متصل بنجاح (WhatsApp Connected)</h1>
+                </div>
+            `);
+        }
+
+        if (!currentQR) {
+            return res.send(`
+                <div style="font-family:sans-serif; text-align:center; padding-top:50px;">
+                    <h1>⏳ جاري توليد الرمز...</h1>
+                    <script>setTimeout(function(){location.reload()}, 2000);</script>
+                </div>
+            `);
+        }
+
+        // تحويل كود الـ QR إلى صورة Base64
+        const url = await QRCode.toDataURL(currentQR);
+        
+        res.send(`
+            <div style="display:flex; justify-content:center; align-items:center; height:100vh; background:#f0f2f5; font-family:sans-serif;">
+                <div style="background:white; padding:20px; border-radius:15px; box-shadow:0 4px 15px rgba(0,0,0,0.1); text-align:center;">
+                    <h2 style="margin-bottom:20px; color:#333;">مسح الرمز للربط 📱</h2>
+                    <img src="${url}" style="width:300px; height:300px;" />
+                    <p style="margin-top:15px; color:#666;">يتم التحديث تلقائياً...</p>
+                </div>
+            </div>
+            <script>setTimeout(function(){location.reload()}, 15000);</script>
+        `);
+
+    } catch (e) {
+        res.status(500).send("Error generating QR");
+    }
+});
 
 // --- 🔌 7. الروابط الخارجية ---
 // أ) المزامنة القسرية (مع فلتر التاريخ + فلتر الحذف الذكي 🗑️)
