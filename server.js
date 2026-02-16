@@ -26,7 +26,10 @@ import fs from 'fs';
 import cors from 'cors';
 
 const PORT = 3000;
-const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://api.taxihon.com/webhook/';
+ const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://api.taxihon.com/webhook/';
+
+// const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://127.0.0.1:8000/webhook/';
+
 const SESSION_DIR = 'auth_info_baileys'; 
 const STORE_FILE = 'baileys_store.json'; 
 const ADMIN_BOT_NUMBERS = ['963931698698', '963931697697'];
@@ -177,7 +180,12 @@ const getJid = (number) => {
 };
 
 const cleanId = (jid) => jid ? jid.split('@')[0].split(':')[0] : null;
-const extractPhoneNumber = (jid) => jid ? jid.split('@')[0].split(':')[0] : null;
+// const extractPhoneNumber = (jid) => jid ? jid.split('@')[0].split(':')[0] : null;
+const extractPhoneNumber = (jid) => {
+    if (!jid) return null;
+    if (jid.includes('@lid')) return null; // 🚫 تجاهل الـ LID تماماً
+    return jid.split('@')[0].split(':')[0];
+};
 
 // --- 🚦 3. معالجات الطوابير ---
 const processMessageQueue = async () => {
@@ -308,47 +316,97 @@ async function startWhatsApp() {
     });
 }
 
-// --- 📨 6. معالج الرسالة ---
+// --- 📨 6. معالج الرسالة (المحدث لاستخراج الرقم بذكاء + حل مشاكل الحذف والتعديل) ---
 async function processSingleMessage(msg, isSync = false) {
     const remoteJid = msg.key.remoteJid;
     const isGroup = remoteJid.endsWith('@g.us');
-    const senderId = cleanId(remoteJid);
-    const participant = msg.key.participant || remoteJid;
+    
+    // 1. استخراج المشارك الخام (قد يكون LID أو JID)
+    let participantRaw = msg.key.participant || remoteJid;
+    
+    // 2. محاولة استخراج الرقم الحقيقي (JID)
+    let phone = extractPhoneNumber(participantRaw);
+    
+    // في المجموعات، إذا كان المشارك LID، نحاول استخراج JID من مصدر آخر إن وجد
+    // (حالياً Baileys لا يسهل هذا، لذا نعتمد على أن Django سيعالج الـ LID لاحقاً)
+    
+    // في الخاص، الرقم هو remoteJid (ما لم يكن LID)
+    if (!isGroup && !phone) {
+        phone = extractPhoneNumber(remoteJid);
+    }
+
+    const senderId = cleanId(remoteJid); // ID الجروب أو الشخص
 
     if (ADMIN_BOT_NUMBERS.includes(senderId)) return;
 
     const messageContent = msg.message;
-    if (!messageContent) return; 
+    if (!messageContent) return;
 
-    let body = messageContent.conversation || 
-               messageContent.extendedTextMessage?.text || 
-               messageContent.imageMessage?.caption || "";
-    
-    if (isSync) {
-        if (!body || body.trim().length === 0) return;
-        else console.log(`✅ [SYNC] ${new Date(msg.messageTimestamp*1000).toLocaleDateString()} | ${body.substring(0, 30)}...`);
+    // 🔥 فحص البروتوكول (حذف / تعديل)
+    const proto = messageContent.protocolMessage;
+    let eventType = 'new_message';
+    let targetMsgId = null;
+    let body = "";
+
+    if (proto) {
+        // حالة الحذف (Revoke)
+        if (proto.type === 'REVOKE' || proto.type === 0) {
+            eventType = 'message_revoke';
+            // ✅ FIX: استخراج ID الرسالة المحذوفة بدقة من مفتاح الرسالة المستهدفة
+            targetMsgId = proto.key?.id; 
+            body = "[REVOKE]"; 
+        } 
+        // حالة التعديل (Edit)
+        else if (proto.type === 'EDIT_MESSAGE' || proto.type === 14) {
+            eventType = 'message_edit';
+            // ✅ FIX: استخراج ID الرسالة الأصلية التي يتم تعديلها
+            targetMsgId = proto.key?.id;
+            // ✅ FIX: استخراج النص الجديد المعدل بشكل صحيح
+            body = proto.editedMessage?.conversation || 
+                   proto.editedMessage?.extendedTextMessage?.text || 
+                   proto.editedMessage?.imageMessage?.caption || ""; // إضافة دعم لتعديل الكابشن للصور
+        }
     }
 
-    if (!body || body.trim().length === 0) return;
+    // استخراج النص العادي (فقط إذا لم يكن تعديل/حذف تم استخراجه أعلاه)
+    if ((!body || body === "") && eventType === 'new_message') {
+        body = messageContent.conversation || 
+               messageContent.extendedTextMessage?.text || 
+               messageContent.imageMessage?.caption || "";
+    }
 
-    const msgType = Object.keys(messageContent)[0];
+    // تجاهل الرسائل الفارغة (إلا إذا كانت حذف)
+    // ✅ ملاحظة: في حالة التعديل، قد يكون النص الجديد فارغاً (حذف النص)، لذا نسمح بذلك إذا كان edit
+    if ((!body || body.trim().length === 0) && eventType === 'new_message') return;
 
+    if (isSync) {
+        console.log(`✅ [SYNC] ${new Date(msg.messageTimestamp*1000).toLocaleDateString()} | ${body.substring(0, 30)}...`);
+    }
+
+    // تجهيز البايلود للإرسال لـ Django
     let payload = {
-        event_type: 'new_message',
+        event_type: eventType, 
+        target_message_id: targetMsgId, // ✅ هذا هو المفتاح للحذف والتعديل
         is_sync: isSync, 
-        whatsapp_message_id: msg.key.id,
+        whatsapp_message_id: msg.key.id, // ID الرسالة الحالية (رسالة الحذف/التعديل نفسها)
         sender_id: senderId,
-        participant_phone: extractPhoneNumber(participant),
-        participant_raw: participant,
+        
+        // 🔥 الحقول المحسنة: نرسل الرقم الصافي والمشارك الخام
+        participant_phone: phone, // سيكون null إذا كان LID
+        participant_raw: participantRaw, // هذا سنستخدمه للرد (Reply Target)
+        
         group_id: isGroup ? remoteJid : null,
-        author_id: isGroup ? participant : null,
+        author_id: isGroup ? participantRaw : null,
         is_group: isGroup,
         message_text: body,
         timestamp: msg.messageTimestamp,
         pushName: msg.pushName
     };
 
-    if (['imageMessage', 'audioMessage', 'videoMessage', 'pttMessage'].includes(msgType)) {
+    // معالجة الميديا (فقط للرسائل الجديدة)
+    // التعديل لا يدعم تغيير الميديا حالياً في هذا الكود البسيط
+    const msgType = Object.keys(messageContent)[0];
+    if (eventType === 'new_message' && ['imageMessage', 'audioMessage', 'videoMessage', 'pttMessage'].includes(msgType)) {
         try {
             const buffer = await downloadMediaMessage(
                 msg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
@@ -361,9 +419,70 @@ async function processSingleMessage(msg, isSync = false) {
         } catch (e) {}
     }
 
-    if (!isSync) console.log(`📤 Live Msg: ${msg.key.id}`);
+    if (!isSync) {
+        console.log(`📤 Live Event: ${eventType} | ID: ${msg.key.id} | Target: ${targetMsgId || 'None'}`);
+        // لوج تشخيصي لرؤية ما يتم إرساله
+        console.log(`   📞 Phone: ${phone} | 🔢 Raw: ${participantRaw}`);
+    }
+    
+    // الإرسال للسيرفر
     await sendToDjango(payload, msg.key);
 }
+// async function processSingleMessage(msg, isSync = false) {
+//     const remoteJid = msg.key.remoteJid;
+//     const isGroup = remoteJid.endsWith('@g.us');
+//     const senderId = cleanId(remoteJid);
+//     const participant = msg.key.participant || remoteJid;
+
+//     if (ADMIN_BOT_NUMBERS.includes(senderId)) return;
+
+//     const messageContent = msg.message;
+//     if (!messageContent) return; 
+
+//     let body = messageContent.conversation || 
+//                messageContent.extendedTextMessage?.text || 
+//                messageContent.imageMessage?.caption || "";
+    
+//     if (isSync) {
+//         if (!body || body.trim().length === 0) return;
+//         else console.log(`✅ [SYNC] ${new Date(msg.messageTimestamp*1000).toLocaleDateString()} | ${body.substring(0, 30)}...`);
+//     }
+
+//     if (!body || body.trim().length === 0) return;
+
+//     const msgType = Object.keys(messageContent)[0];
+
+//     let payload = {
+//         event_type: 'new_message',
+//         is_sync: isSync, 
+//         whatsapp_message_id: msg.key.id,
+//         sender_id: senderId,
+//         participant_phone: extractPhoneNumber(participant),
+//         participant_raw: participant,
+//         group_id: isGroup ? remoteJid : null,
+//         author_id: isGroup ? participant : null,
+//         is_group: isGroup,
+//         message_text: body,
+//         timestamp: msg.messageTimestamp,
+//         pushName: msg.pushName
+//     };
+
+//     if (['imageMessage', 'audioMessage', 'videoMessage', 'pttMessage'].includes(msgType)) {
+//         try {
+//             const buffer = await downloadMediaMessage(
+//                 msg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+//             );
+//             if (buffer) {
+//                 payload.has_media = true;
+//                 payload.media_data = buffer.toString('base64');
+//                 if (!body || body === "") payload.message_text = `[MEDIA: ${msgType}]`;
+//             }
+//         } catch (e) {}
+//     }
+
+//     if (!isSync) console.log(`📤 Live Msg: ${msg.key.id}`);
+//     await sendToDjango(payload, msg.key);
+// }
 
 // رابط عرض الـ QR Code في المتصفح
 app.get('/qr-code', async (req, res) => {
