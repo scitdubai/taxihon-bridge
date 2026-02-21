@@ -2,10 +2,11 @@
  * TaxiHon Bridge - Diamond Edition 💎 (High Load Optimized)
  * Status: FINAL PRODUCTION READY
  * Features:
- * 1. 🛡️ Crash-Proof & Memory Safe.
- * 2. ⚡ Smart Reaction Queue.
+ * 1. 🛡️ Crash-Proof & Memory Safe (Atomic Saves).
+ * 2. ⚡ Smart Reaction Queue & Connection Backoff.
  * 3. 🗓️ 32-Day Rolling Window (Accounting Mode).
  * 4. 🚀 Async Saving (Non-blocking I/O).
+ * 5. 🚨 Auto-Healing & SOS Alerts to Django.
  */
 
 import { 
@@ -26,13 +27,13 @@ import fs from 'fs';
 import cors from 'cors';
 
 const PORT = 3000;
- const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://api.taxihon.com/webhook/';
+//  const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://api.taxihon.com/webhook/';
 
-// const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://127.0.0.1:8000/webhook/';
+ const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://127.0.0.1:8000/webhook/';
 
 const SESSION_DIR = 'auth_info_baileys'; 
 const STORE_FILE = 'baileys_store.json'; 
-const ADMIN_BOT_NUMBERS = ['963931698698', '963931697697'];
+const ADMIN_BOT_NUMBERS = ['963931698655', '963931697655'];
 
 const app = express();
 app.use(cors());
@@ -59,17 +60,26 @@ const store = {
         } catch (e) { console.error("⚠️ Store load error:", e.message); }
     },
     
+    // 🛡️ [تعديل أمني]: الحفظ الذري الآمن (Atomic Save) لمنع تلف الملفات عند انقطاع الكهرباء
     writeToFile: () => {
         if (store.isSaving) return;
         store.isSaving = true;
         
-        console.log("💾 Saving data to disk...");
+        console.log("💾 Saving data to disk safely...");
         try {
             const data = JSON.stringify(store.messages);
-            fs.writeFile(STORE_FILE, data, (err) => {
-                store.isSaving = false;
-                if (err) console.error("⚠️ Write Error:", err);
-                else console.log("✅ Data saved successfully.");
+            const tmpFile = STORE_FILE + '.tmp'; 
+            
+            fs.writeFile(tmpFile, data, (err) => {
+                if (err) {
+                    store.isSaving = false;
+                    return console.error("⚠️ Write Error:", err);
+                }
+                fs.rename(tmpFile, STORE_FILE, (renameErr) => {
+                    store.isSaving = false;
+                    if (renameErr) console.error("⚠️ Rename Error:", renameErr);
+                    // else console.log("✅ Data saved atomically.");
+                });
             });
         } catch (e) {
             store.isSaving = false;
@@ -156,9 +166,13 @@ setInterval(() => {
     store.writeToFile();
 }, SAVE_INTERVAL_MS);
 
-// حفظ الطوارئ
+// 🛡️ [تعديل أمني]: حفظ الطوارئ (تنظيف وإغلاق آمن)
 process.on('SIGINT', () => { 
-    try { fs.writeFileSync(STORE_FILE, JSON.stringify(store.messages)); } catch(e){}
+    console.log("\n🛑 Shutting down safely...");
+    try { 
+        store.cleanup();
+        fs.writeFileSync(STORE_FILE, JSON.stringify(store.messages)); 
+    } catch(e) {}
     process.exit(); 
 });
 
@@ -169,6 +183,8 @@ let messageQueue = [];
 let reactionQueue = []; 
 let isProcessingReactions = false;
 let currentQR = null;
+let reconnectAttempts = 0; // 💡 عداد محاولات الاتصال للتباعد الذكي
+
 // --- Helpers ---
 const getJid = (number) => {
     if (!number) return null;
@@ -183,8 +199,23 @@ const cleanId = (jid) => jid ? jid.split('@')[0].split(':')[0] : null;
 // const extractPhoneNumber = (jid) => jid ? jid.split('@')[0].split(':')[0] : null;
 const extractPhoneNumber = (jid) => {
     if (!jid) return null;
-    if (jid.includes('@lid')) return null; // 🚫 تجاهل الـ LID تماماً
-    return jid.split('@')[0].split(':')[0];
+
+    // تنظيف المعرف من الـ Device ID (مثل 9639xxx:1@s.whatsapp.net)
+    // نأخذ ما قبل الـ @ ثم ما قبل الـ :
+    const cleanJid = jid.split('@')[0].split(':')[0];
+
+    // 1. إذا كان رقم هاتف عادي
+    if (jid.endsWith('@s.whatsapp.net')) {
+        return cleanJid;
+    }
+
+    // 2. إذا كان رقم مشفر (LID)
+    if (jid.endsWith('@lid')) {
+        return cleanJid; // سيعيد المعرف المشفر الصافي (أرقام فقط بدون @lid)
+    }
+
+    // 3. المجموعات أو غيرها
+    return cleanJid;
 };
 
 // --- 🚦 3. معالجات الطوابير ---
@@ -205,13 +236,17 @@ const processReactionQueue = async () => {
     if (isProcessingReactions || reactionQueue.length === 0) return;
     isProcessingReactions = true;
     while (reactionQueue.length > 0) {
-        const item = reactionQueue.shift();
-        if (sock && isWaConnected) {
-            try {
-                await sock.sendMessage(item.chatId, { react: { text: item.reaction, key: item.key } });
-                await delay(600);
-            } catch (e) { console.error("React Error:", e.message); }
+        // 🛡️ [تعديل أمني]: حماية الطابور من التوقف في حال انقطاع السوكيت
+        if (!sock || !isWaConnected) {
+            console.log("⚠️ Socket disconnected, pausing reaction queue.");
+            break; 
         }
+
+        const item = reactionQueue.shift();
+        try {
+            await sock.sendMessage(item.chatId, { react: { text: item.reaction, key: item.key } });
+            await delay(600);
+        } catch (e) { console.error("⚠️ React Error:", e.message); }
     }
     isProcessingReactions = false;
 };
@@ -265,6 +300,7 @@ async function startWhatsApp() {
 
     sock.ev.on('creds.update', saveCreds);
 
+    // 🛡️ [تعديل أمني]: خوارزمية التباعد الذكي ونداء الاستغاثة (SOS)
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
@@ -275,14 +311,46 @@ async function startWhatsApp() {
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('⚠️ Reconnecting:', shouldReconnect);
-            if (shouldReconnect) setTimeout(startWhatsApp, 2000);
-        } else if (connection === 'open') {
-           console.log('✅ WhatsApp Connected Successfully!');
-            currentQR = null; // ✅ تصفير الرمز عند الاتصال
+            isWaConnected = false;
+            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+            console.log(`⚠️ Connection closed (Code: ${statusCode}). Reconnecting: ${shouldReconnect}`);
+
+            if (shouldReconnect) {
+                // خوارزمية التباعد الذكي لمنع الحظر
+                let delayMs = statusCode === DisconnectReason.restartRequired 
+                              ? 1000 
+                              : Math.min(1000 * Math.pow(2, reconnectAttempts), 60000);
+                
+                reconnectAttempts++;
+                console.log(`⏳ Attempt ${reconnectAttempts}: Reconnecting in ${delayMs/1000} seconds...`);
+                setTimeout(startWhatsApp, delayMs);
+            } else {
+                // تدمير الجلسة الميتة آلياً
+                console.log('❌ LOGGED OUT! Device unlinked. Cleaning up session for new QR...');
+                
+                // 🚨🚨 إرسال نداء استغاثة لجانغو (SOS Alert) 🚨🚨
+                const alertUrl = DJANGO_WEBHOOK_URL.replace('webhook/', 'api/v1/system-configs/bridge_alert/');
+                axios.post(alertUrl, {
+                    alert_type: "LOGGED_OUT",
+                    message: "تم فصل جسر الواتساب! يرجى الدخول ومسح الـ QR."
+                }).catch(err => console.error("⚠️ Failed to send SOS to Django"));
+
+                try {
+                    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+                    currentQR = null;
+                    setTimeout(startWhatsApp, 3000); // إعادة تشغيل نظيفة لتوليد QR جديد
+                } catch(e) { console.error("Session delete error:", e); }
+            }
+        } 
+        else if (connection === 'open') {
+            console.log('✅ WhatsApp Connected Successfully!');
+            currentQR = null; 
             isWaConnected = true;
+            reconnectAttempts = 0; // تصفير العداد
             if (messageQueue.length > 0) processMessageQueue();
+            if (reactionQueue.length > 0) processReactionQueue();
         }
     });
 
@@ -304,6 +372,9 @@ async function startWhatsApp() {
         if (type === 'notify') {
             for (const msg of messages) {
                 try {
+                    // 🛡️ [تعديل أمني]: تنظيف البيانات غير الضرورية من الرام لمنع تضخم الـ Store
+                    if (msg.message?.messageContextInfo) delete msg.message.messageContextInfo;
+
                     if (msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
                     await processSingleMessage(msg, false); 
                 } catch (err) {}
@@ -321,16 +392,15 @@ async function processSingleMessage(msg, isSync = false) {
     const remoteJid = msg.key.remoteJid;
     const isGroup = remoteJid.endsWith('@g.us');
     
-    // 1. استخراج المشارك الخام (قد يكون LID أو JID)
+    // 1. استخراج المشارك الخام (JID أو LID)
+    // في المجموعات نأخذ participant، في الخاص نأخذ remoteJid
     let participantRaw = msg.key.participant || remoteJid;
     
-    // 2. محاولة استخراج الرقم الحقيقي (JID)
+    // 2. محاولة استخراج الرقم الحقيقي أو المعرف الصافي (LID)
+    // الدالة المحدثة ستعيد الرقم لـ @s.whatsapp.net أو المعرف لـ @lid
     let phone = extractPhoneNumber(participantRaw);
     
-    // في المجموعات، إذا كان المشارك LID، نحاول استخراج JID من مصدر آخر إن وجد
-    // (حالياً Baileys لا يسهل هذا، لذا نعتمد على أن Django سيعالج الـ LID لاحقاً)
-    
-    // في الخاص، الرقم هو remoteJid (ما لم يكن LID)
+    // في الخاص، إذا كان المشارك LID، نستخدم الرقم المباشر من remoteJid إن أمكن
     if (!isGroup && !phone) {
         phone = extractPhoneNumber(remoteJid);
     }
@@ -352,59 +422,57 @@ async function processSingleMessage(msg, isSync = false) {
         // حالة الحذف (Revoke)
         if (proto.type === 'REVOKE' || proto.type === 0) {
             eventType = 'message_revoke';
-            // ✅ FIX: استخراج ID الرسالة المحذوفة بدقة من مفتاح الرسالة المستهدفة
             targetMsgId = proto.key?.id; 
             body = "[REVOKE]"; 
         } 
         // حالة التعديل (Edit)
         else if (proto.type === 'EDIT_MESSAGE' || proto.type === 14) {
             eventType = 'message_edit';
-            // ✅ FIX: استخراج ID الرسالة الأصلية التي يتم تعديلها
             targetMsgId = proto.key?.id;
-            // ✅ FIX: استخراج النص الجديد المعدل بشكل صحيح
             body = proto.editedMessage?.conversation || 
                    proto.editedMessage?.extendedTextMessage?.text || 
-                   proto.editedMessage?.imageMessage?.caption || ""; // إضافة دعم لتعديل الكابشن للصور
+                   proto.editedMessage?.imageMessage?.caption || ""; 
         }
     }
 
-    // استخراج النص العادي (فقط إذا لم يكن تعديل/حذف تم استخراجه أعلاه)
+    // استخراج النص من كافة الحقول المحتملة بما فيها الأزرار
     if ((!body || body === "") && eventType === 'new_message') {
         body = messageContent.conversation || 
                messageContent.extendedTextMessage?.text || 
-               messageContent.imageMessage?.caption || "";
+               messageContent.imageMessage?.caption || 
+               messageContent.templateButtonReplyMessage?.selectedId || 
+               messageContent.buttonsResponseMessage?.selectedButtonId || 
+               "";
     }
 
-    // تجاهل الرسائل الفارغة (إلا إذا كانت حذف)
-    // ✅ ملاحظة: في حالة التعديل، قد يكون النص الجديد فارغاً (حذف النص)، لذا نسمح بذلك إذا كان edit
+    // تجاهل الرسائل الفارغة (إلا إذا كانت حذف أو تعديل)
     if ((!body || body.trim().length === 0) && eventType === 'new_message') return;
 
     if (isSync) {
         console.log(`✅ [SYNC] ${new Date(msg.messageTimestamp*1000).toLocaleDateString()} | ${body.substring(0, 30)}...`);
     }
 
-    // تجهيز البايلود للإرسال لـ Django
+    // تجهيز البايلود الشامل لضمان وصول كل التفاصيل لـ Django
     let payload = {
         event_type: eventType, 
-        target_message_id: targetMsgId, // ✅ هذا هو المفتاح للحذف والتعديل
+        target_message_id: targetMsgId, 
         is_sync: isSync, 
-        whatsapp_message_id: msg.key.id, // ID الرسالة الحالية (رسالة الحذف/التعديل نفسها)
+        whatsapp_message_id: msg.key.id, 
         sender_id: senderId,
         
-        // 🔥 الحقول المحسنة: نرسل الرقم الصافي والمشارك الخام
-        participant_phone: phone, // سيكون null إذا كان LID
-        participant_raw: participantRaw, // هذا سنستخدمه للرد (Reply Target)
+        // الحقول المحسنة لضمان الدقة مع الأرقام المشفرة
+        participant_phone: phone,          // الرقم الصافي أو الـ LID الصافي
+        participant_raw: participantRaw,   // المعرف الكامل (للرد المباشر)
+        pushName: msg.pushName || "",     // اسم المستخدم على واتساب
         
         group_id: isGroup ? remoteJid : null,
         author_id: isGroup ? participantRaw : null,
         is_group: isGroup,
         message_text: body,
-        timestamp: msg.messageTimestamp,
-        pushName: msg.pushName
+        timestamp: msg.messageTimestamp
     };
 
-    // معالجة الميديا (فقط للرسائل الجديدة)
-    // التعديل لا يدعم تغيير الميديا حالياً في هذا الكود البسيط
+    // معالجة الميديا (صور، صوت، فيديو)
     const msgType = Object.keys(messageContent)[0];
     if (eventType === 'new_message' && ['imageMessage', 'audioMessage', 'videoMessage', 'pttMessage'].includes(msgType)) {
         try {
@@ -416,16 +484,17 @@ async function processSingleMessage(msg, isSync = false) {
                 payload.media_data = buffer.toString('base64');
                 if (!body || body === "") payload.message_text = `[MEDIA: ${msgType}]`;
             }
-        } catch (e) {}
+        } catch (e) {
+            console.error("❌ Media download error:", e.message);
+        }
     }
 
     if (!isSync) {
         console.log(`📤 Live Event: ${eventType} | ID: ${msg.key.id} | Target: ${targetMsgId || 'None'}`);
-        // لوج تشخيصي لرؤية ما يتم إرساله
-        console.log(`   📞 Phone: ${phone} | 🔢 Raw: ${participantRaw}`);
+        console.log(`   📞 Extracted: ${phone} | 🔢 RawID: ${participantRaw}`);
     }
     
-    // الإرسال للسيرفر
+    // الإرسال للسيرفر (Django Webhook)
     await sendToDjango(payload, msg.key);
 }
 // async function processSingleMessage(msg, isSync = false) {
@@ -524,7 +593,7 @@ app.get('/qr-code', async (req, res) => {
 });
 
 // --- 🔌 7. الروابط الخارجية ---
-// أ) المزامنة القسرية (مع فلتر التاريخ + فلتر الحذف الذكي 🗑️)
+// أ) المزامنة القسرية (مع فلتر التاريخ الدقيق + فلتر الحذف الذكي 🗑️)
 app.post('/force-sync', async (req, res) => {
     const { phone, limit, startDate, endDate } = req.body;
     
@@ -539,16 +608,17 @@ app.post('/force-sync', async (req, res) => {
             return res.json({ status: "empty", message: "الأرشيف فارغ." });
         }
 
-        // --- 🗑️ 1. بناء قائمة المحذوفات (Blacklist) ---
-        // نقوم بمسح كامل الرسائل للبحث عن أوامر الحذف (Revoke)
+        // --- 🗑️ 1. بناء قائمة المحذوفات الشاملة (Blacklist) ---
         const revokedIds = new Set();
         messages.forEach(msg => {
+            // صيد أوامر الـ REVOKE الصريحة
             const proto = msg.message?.protocolMessage;
-            // Baileys: نوع REVOKE عادة يكون 0
             if (proto && (proto.type === 'REVOKE' || proto.type === 0)) {
-                if (proto.key && proto.key.id) {
-                    revokedIds.add(proto.key.id);
-                }
+                if (proto.key && proto.key.id) revokedIds.add(proto.key.id);
+            }
+            // صيد الأشباح المتخفية (StubType 68)
+            if (msg.messageStubType === 68 && msg.key && msg.key.id) {
+                revokedIds.add(msg.key.id);
             }
         });
         
@@ -558,18 +628,24 @@ app.post('/force-sync', async (req, res) => {
 
         // --- 2. الفلترة والتجهيز ---
         let msgsToSync = messages.filter(m => {
-            // أ) استبعاد الرسالة إذا كانت هي نفسها أمر حذف (protocolMessage)
+            // استبعاد المحذوفات بكل أنواعها
             if (m.message?.protocolMessage) return false;
-
-            // ب) استبعاد الرسالة إذا كان الـ ID الخاص بها موجود في قائمة المحذوفات
+            if (m.messageStubType === 68) return false;
             if (m.key && revokedIds.has(m.key.id)) return false;
 
-            // ج) فلتر التاريخ (إذا وجد)
+            // التأكد من وجود نص حقيقي وفعلي (يمنع مرور غلاف الرسالة المحذوفة)
+            const text = m.message?.conversation || 
+                         m.message?.extendedTextMessage?.text || 
+                         m.message?.imageMessage?.caption || "";
+            
+            if (!text || text.trim().length < 15) return false;
+
+            // ج) فلتر التاريخ الدقيق (بدون أي تلاعب أو إضافات)
             if (startDate) {
                 const startTimestamp = new Date(startDate).getTime() / 1000;
                 let endTimestamp = Infinity;
                 if (endDate) {
-                    endTimestamp = (new Date(endDate).getTime() / 1000) + 86400; // نهاية اليوم + 24 ساعة
+                    endTimestamp = new Date(endDate).getTime() / 1000; 
                 }
                 const t = m.messageTimestamp || 0;
                 return t >= startTimestamp && t <= endTimestamp;
@@ -616,6 +692,177 @@ app.post('/force-sync', async (req, res) => {
     }
 });
 
+// ج) الجرد المبني على حالة الواتساب الحالية (State-based Inventory)
+// ج) الجرد بنظام "الفلاج" (Mark-and-Sweep Inventory)
+// ج) الجرد المبني على حالة الواتساب الحالية (State-based Inventory)
+// ج) الجرد بنظام "الفلاج" (Mark-and-Sweep Inventory)
+app.post('/get-inventory', async (req, res) => {
+    const { phone, startDate, endDate } = req.body;
+    
+    try {
+        const jid = getJid(phone);
+        const messages = store.messages[jid] || [];
+        const cleanInvoiceIds = [];
+
+        // 1. تحديد حدود التاريخ
+        const startTimestamp = startDate ? new Date(startDate).getTime() / 1000 : 0;
+        let endTimestamp = Infinity;
+        if (endDate) {
+            // 🔥 تمت استعادة الكود الخاص بك لضمان شمول آخر ثانية من اليوم
+            const endD = new Date(endDate);
+            endD.setHours(23, 59, 59, 999);
+            endTimestamp = endD.getTime() / 1000;
+        }
+
+        // 2. بناء قائمة المحذوفات الشاملة لاستبعادها
+        const revokedIds = new Set();
+        messages.forEach(msg => {
+            const proto = msg.message?.protocolMessage;
+            if (proto && (proto.type === 'REVOKE' || proto.type === 0)) {
+                if (proto.key && proto.key.id) revokedIds.add(proto.key.id);
+            }
+            // 👻 صيد الأشباح
+            if (msg.messageStubType === 68 && msg.key && msg.key.id) {
+                revokedIds.add(msg.key.id);
+            }
+        });
+
+        // 3. بناء القائمة النظيفة (فواتير فقط، ضمن التاريخ، غير محذوفة)
+        messages.forEach(msg => {
+            if (msg.key && msg.key.id) {
+                let msgTime = (typeof msg.messageTimestamp === 'number') 
+                              ? msg.messageTimestamp 
+                              : (msg.messageTimestamp ? msg.messageTimestamp.low : 0);
+
+                if (msgTime >= startTimestamp && msgTime <= endTimestamp) {
+                    const isProtocol = !!msg.message?.protocolMessage;
+                    const isFromMe = msg.key.fromMe;
+                    const isStubGhost = msg.messageStubType === 68; // 🛡️ حماية الأشباح
+                    
+                    if (!isProtocol && !isFromMe && !isStubGhost && !revokedIds.has(msg.key.id)) {
+                        const text = msg.message?.conversation || 
+                                     msg.message?.extendedTextMessage?.text || 
+                                     msg.message?.imageMessage?.caption || "";
+                        
+                        // فلتر الفواتير + التأكد من طول النص لمنع مرور الأشباح
+                        const isInvoiceLike = /فاتور|اجر|أجر|توصيل|تعويض|غرام|مخالف|كابتن|سائق|مندوب|منسق|كونترول|كنترول/i.test(text);
+                        if (isInvoiceLike && text.length > 15) {
+                            cleanInvoiceIds.push(msg.key.id.toUpperCase());
+                        }
+                    }
+                }
+            }
+        });
+
+        console.log(`✅ [Inventory] Dates: ${startDate} -> ${endDate} | Clean Sent: ${cleanInvoiceIds.length}`);
+        res.json({ status: "success", clean_ids: cleanInvoiceIds });
+
+    } catch (error) {
+        console.error("Inventory Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 📡 دالة الاستطلاع (The Probe): تعيد النطاق الزمني الفعلي المتوفر في الرام
+// 📡 دالة الاستطلاع (The Probe): تعيد النطاق الزمني الفعلي المتوفر في الرام
+app.post('/check-inventory-range', async (req, res) => {
+    const { phone, target_date } = req.body; // يتوقع YYYY-MM-DD
+    
+    try {
+        const jid = getJid(phone);
+        const messages = store.messages[jid] || [];
+        
+        // حساب بداية ونهاية اليوم المطلوب بالثواني
+        const startOfDay = new Date(`${target_date}T00:00:00`).getTime() / 1000;
+        const endOfDay = new Date(`${target_date}T23:59:59.999`).getTime() / 1000;
+
+        let minTs = Infinity;
+        let maxTs = 0;
+        let validCount = 0;
+
+        messages.forEach(msg => {
+            let msgTime = (typeof msg.messageTimestamp === 'number') 
+                          ? msg.messageTimestamp 
+                          : (msg.messageTimestamp ? msg.messageTimestamp.low : 0);
+
+            // إذا كانت الرسالة ضمن اليوم المطلوب وليست من البوت
+            if (msgTime >= startOfDay && msgTime <= endOfDay && !msg.key.fromMe) {
+                
+                // 🔥 [التعديل الأمني هنا]: استبعاد الأشباح الصريحة والأشباح الخفية (Stub 68)
+                const proto = msg.message?.protocolMessage;
+                const isRevoke = proto && (proto.type === 'REVOKE' || proto.type === 0);
+                const isStubGhost = msg.messageStubType === 68;
+
+                // نقبل الرسالة في حساب الوقت فقط إذا لم تكن محذوفة نهائياً
+                if (!isRevoke && !isStubGhost) {
+                    if (msgTime < minTs) minTs = msgTime;
+                    if (msgTime > maxTs) maxTs = msgTime;
+                    validCount++;
+                }
+            }
+        });
+
+        if (validCount === 0) {
+            return res.json({ status: "empty", message: "لا توجد بيانات لهذا اليوم في ذاكرة الجسر" });
+        }
+
+        res.json({ 
+            status: "success", 
+            count: validCount,
+            min_timestamp: minTs, // أقدم رسالة حقيقية في الرام
+            max_timestamp: maxTs  // أحدث رسالة حقيقية في الرام
+        });
+
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// د) جلب رسائل محددة بالـ ID (لاسترجاع المفقودات فقط - Smart Fetch)
+app.post('/fetch-messages-batch', async (req, res) => {
+    const { phone, messageIds } = req.body;
+    const jid = getJid(phone);
+    const messages = store.messages[jid];
+
+    if (!messages || !messageIds || !Array.isArray(messageIds)) {
+        return res.json({ status: "empty", messages: [] });
+    }
+
+    // نوحد الـ IDs للبحث (Uppercase)
+    const messageIdsSet = new Set(messageIds.map(id => id.toUpperCase()));
+    const foundMessages = [];
+
+    messages.forEach(msg => {
+        if (msg.key && msg.key.id) {
+            const currentId = msg.key.id.toUpperCase();
+            
+            if (messageIdsSet.has(currentId)) {
+                const text = msg.message?.conversation || 
+                             msg.message?.extendedTextMessage?.text || 
+                             msg.message?.imageMessage?.caption || "";
+                
+                // التعامل الآمن مع التوقيت
+                let msgTime = (typeof msg.messageTimestamp === 'number') 
+                              ? msg.messageTimestamp 
+                              : (msg.messageTimestamp ? msg.messageTimestamp.low : Math.floor(Date.now()/1000));
+
+                foundMessages.push({
+                    id: msg.key.id,
+                    text: text,
+                    timestamp: new Date(msgTime * 1000).toISOString(),
+                    sender: msg.key.participant || msg.key.remoteJid
+                });
+            }
+        }
+    });
+
+    res.json({ 
+        status: "success", 
+        count: foundMessages.length, 
+        messages: foundMessages 
+    });
+});
+
 // ب) ماسح الأشباح (Scan Revoked) 👻
 app.post('/scan-revoked', async (req, res) => {
     const { phone } = req.body;
@@ -633,6 +880,10 @@ app.post('/scan-revoked', async (req, res) => {
                 revokedIds.add(proto.key.id);
             }
         }
+        // إضافة صيد الأشباح هنا أيضاً لضمان التوافق
+        if (msg.messageStubType === 68 && msg.key && msg.key.id) {
+            revokedIds.add(msg.key.id);
+        }
     });
 
     console.log(`👻 [Ghost Scanner] Found ${revokedIds.size} deletion requests in WhatsApp history.`);
@@ -644,6 +895,7 @@ app.post('/scan-revoked', async (req, res) => {
         ids: Array.from(revokedIds) 
     });
 });
+
 // أ) المزامنة القسرية (مع فلتر التاريخ)
 // app.post('/force-sync', async (req, res) => {
 //     const { phone, limit, startDate, endDate } = req.body;
@@ -736,6 +988,48 @@ app.post('/kick-member', async (req, res) => {
         await sock.groupParticipantsUpdate(getJid(req.body.group_id), [getJid(req.body.phone)], "remove");
         res.json({ status: 'success' });
     } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// 🔍 أداة التشريح الجنائي المعمق لرسالة محددة (Deep Forensic Debugger)
+app.post('/debug-message', async (req, res) => {
+    const { phone, message_id } = req.body;
+    
+    try {
+        const jid = getJid(phone);
+        const messages = store.messages[jid] || [];
+        
+        const foundLogs = [];
+        
+        messages.forEach(msg => {
+            let isTarget = false;
+            
+            // 1. هل هي الرسالة الأصلية؟
+            if (msg.key && msg.key.id === message_id) {
+                isTarget = true;
+            }
+            // 2. هل هي رسالة بروتوكول (حذف/تعديل) تستهدف هذه الرسالة؟
+            if (msg.message?.protocolMessage?.key?.id === message_id) {
+                isTarget = true;
+            }
+            
+            if (isTarget) {
+                foundLogs.push(msg);
+            }
+        });
+
+        console.log(`\n🕵️‍♂️ [FORENSIC DEBUG] Found ${foundLogs.length} records for ID: ${message_id}`);
+        console.log(JSON.stringify(foundLogs, null, 2));
+        console.log("---------------------------------------------------\n");
+
+        res.json({
+            status: "success",
+            count: foundLogs.length,
+            raw_data: foundLogs
+        });
+
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
 });
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
