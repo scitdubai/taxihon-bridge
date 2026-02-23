@@ -27,13 +27,13 @@ import fs from 'fs';
 import cors from 'cors';
 
 const PORT = 3000;
-//  const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://api.taxihon.com/webhook/';
+ const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://api.taxihon.com/webhook/';
 
- const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://127.0.0.1:8000/webhook/';
+//  const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://127.0.0.1:8000/webhook/';
 
 const SESSION_DIR = 'auth_info_baileys'; 
 const STORE_FILE = 'baileys_store.json'; 
-const ADMIN_BOT_NUMBERS = ['963931698655', '963931697655'];
+const ADMIN_BOT_NUMBERS = ['963931698698', '963931697697'];
 
 const app = express();
 app.use(cors());
@@ -594,8 +594,14 @@ app.get('/qr-code', async (req, res) => {
 
 // --- 🔌 7. الروابط الخارجية ---
 // أ) المزامنة القسرية (مع فلتر التاريخ الدقيق + فلتر الحذف الذكي 🗑️)
+// أ) المزامنة القسرية (النسخة النهائية والمحصنة - Diamond Edition)
 app.post('/force-sync', async (req, res) => {
-    const { phone, limit, startDate, endDate } = req.body;
+    // 1. استلام وتأمين المتغيرات (Safe Type Casting)
+    const { phone, limit, start_ts, end_ts } = req.body;
+    
+    // ضمان أن التواريخ القادمة هي أرقام (Numbers) وليست نصوصاً (Strings)
+    const safeStartTs = start_ts ? Number(start_ts) : null;
+    const safeEndTs = end_ts ? Number(end_ts) : null;
     
     try {
         const jid = getJid(phone);
@@ -605,18 +611,18 @@ app.post('/force-sync', async (req, res) => {
         console.log(`🧐 [DEBUG] RAM Messages: ${totalAvailable}`);
 
         if (!messages || totalAvailable === 0) {
-            return res.json({ status: "empty", message: "الأرشيف فارغ." });
+            return res.json({ status: "empty", message: "الأرشيف فارغ في الذاكرة." });
         }
 
-        // --- 🗑️ 1. بناء قائمة المحذوفات الشاملة (Blacklist) ---
+        // --- 🗑️ 2. بناء قائمة المحذوفات الشاملة (Blacklist) بصرامة ---
         const revokedIds = new Set();
         messages.forEach(msg => {
-            // صيد أوامر الـ REVOKE الصريحة
+            // أ. صيد أوامر الحذف الصريحة (REVOKE)
             const proto = msg.message?.protocolMessage;
             if (proto && (proto.type === 'REVOKE' || proto.type === 0)) {
                 if (proto.key && proto.key.id) revokedIds.add(proto.key.id);
             }
-            // صيد الأشباح المتخفية (StubType 68)
+            // ب. صيد الأشباح المتخفية (StubType 68)
             if (msg.messageStubType === 68 && msg.key && msg.key.id) {
                 revokedIds.add(msg.key.id);
             }
@@ -626,69 +632,95 @@ app.post('/force-sync', async (req, res) => {
             console.log(`🧹 [Smart Filter] Found ${revokedIds.size} deleted messages. They will be ignored.`);
         }
 
-        // --- 2. الفلترة والتجهيز ---
+        // --- ⚙️ 3. الفلترة والتجهيز (The Core Engine) ---
         let msgsToSync = messages.filter(m => {
-            // استبعاد المحذوفات بكل أنواعها
+            // 1. استبعاد الأشباح والمحذوفات فوراً
             if (m.message?.protocolMessage) return false;
             if (m.messageStubType === 68) return false;
             if (m.key && revokedIds.has(m.key.id)) return false;
 
-            // التأكد من وجود نص حقيقي وفعلي (يمنع مرور غلاف الرسالة المحذوفة)
+            // 2. التأكد من وجود نص حقيقي وفعلي (استبعاد الرسائل الفارغة والميديا الصامتة)
             const text = m.message?.conversation || 
                          m.message?.extendedTextMessage?.text || 
                          m.message?.imageMessage?.caption || "";
             
             if (!text || text.trim().length < 15) return false;
 
-            // ج) فلتر التاريخ الدقيق (بدون أي تلاعب أو إضافات)
-            if (startDate) {
-                const startTimestamp = new Date(startDate).getTime() / 1000;
-                let endTimestamp = Infinity;
-                if (endDate) {
-                    endTimestamp = new Date(endDate).getTime() / 1000; 
+            // 🔥 3. الفلتر الزمني المطلق (الحل الجذري لمشكلة تخطي الفواتير) 🔥
+            // 🔥 3. الفلتر الزمني المطلق (المدعوم باستخراج التوقيت العميق) 🔥
+            if (safeStartTs && safeEndTs) {
+                let msgTime = 0;
+                
+                if (typeof m.messageTimestamp === 'number') {
+                    msgTime = m.messageTimestamp;
+                } else if (m.messageTimestamp && typeof m.messageTimestamp.low === 'number') {
+                    msgTime = m.messageTimestamp.low;
+                } else if (m.messageTimestamp && typeof m.messageTimestamp.toString === 'function') {
+                    msgTime = parseInt(m.messageTimestamp.toString(), 10);
                 }
-                const t = m.messageTimestamp || 0;
-                return t >= startTimestamp && t <= endTimestamp;
+                
+                if (msgTime === 0 && m.message && m.message.messageContextInfo) {
+                   let ctxTime = m.message.messageContextInfo.messageTimestamp;
+                   if (typeof ctxTime === 'number') msgTime = ctxTime;
+                   else if (ctxTime && typeof ctxTime.low === 'number') msgTime = ctxTime.low;
+                }
+
+                if (msgTime === 0) return false;
+
+                return msgTime >= safeStartTs && msgTime <= safeEndTs;
             }
             
             return true;
         });
 
-        // تطبيق الـ Limit (نأخذ آخر العدد المطلوب من الرسائل الصافية)
-        if (!startDate) {
-            const actualLimit = limit || 100;
+        // --- 📏 4. تطبيق حدود العدد (إذا لم يتم استخدام التاريخ) ---
+        if (!safeStartTs) {
+            const actualLimit = Number(limit) || 100;
             msgsToSync = msgsToSync.slice(-actualLimit);
         }
 
         const totalCount = msgsToSync.length;
         
         if (totalCount === 0) {
-            return res.json({ status: "skipped", message: "لا توجد رسائل صالحة (قد تكون كلها محذوفة أو خارج التاريخ)." });
+            return res.json({ 
+                status: "skipped", 
+                message: "لا توجد رسائل صالحة (قد تكون كلها محذوفة، نصوص قصيرة، أو خارج المجال الزمني)." 
+            });
         }
         
+        // إرسال الرد السريع للواجهة لفك تعليق زر التحميل
         res.json({ 
             status: "started", 
-            message: `جاري معالجة ${totalCount} رسالة (بعد استبعاد المحذوف)...`, 
+            message: `جاري معالجة ${totalCount} رسالة (بعد التصفية الدقيقة)...`, 
             target_id: jid 
         });
 
-        // --- 3. التنفيذ في الخلفية ---
+        // --- 🚀 5. التنفيذ في الخلفية (Non-blocking Queue) ---
         (async () => {
-            console.log(`🔄 [Sync] Start sending ${totalCount} clean messages...`);
+            console.log(`🔄 [Sync] Start sending ${totalCount} clean messages to Django...`);
+            let successCount = 0;
+            let failCount = 0;
+
             for (const msg of msgsToSync) {
                 try {
-                    // نرسل مع flag: true للمزامنة
+                    // إرسال الرسالة إلى دالة المعالجة مع تفعيل الفلاج (isSync = true)
                     await processSingleMessage(msg, true);
-                    // تأخير بسيط جداً لمنع اختناق الشبكة
+                    successCount++;
+                    // تأخير مدروس (10 ميلي ثانية) لمنع خنق شبكة السيرفر (DDoS الذاتي)
                     await delay(10); 
-                } catch (err) { console.error("Sync msg error:", err.message); }
+                } catch (err) { 
+                    failCount++;
+                    console.error(`⚠️ Sync msg error (ID: ${msg.key?.id}):`, err.message); 
+                }
             }
-            console.log(`✅ [Sync] Done.`);
+            console.log(`✅ [Sync] Done. Success: ${successCount} | Failed: ${failCount}`);
         })();
 
     } catch (e) {
-        console.error("Force Sync Error:", e);
-        if (!res.headersSent) res.status(500).json({ error: e.message });
+        console.error("🔥 Force Sync Critical Error:", e);
+        if (!res.headersSent) {
+            res.status(500).json({ error: e.message || "حدث خطأ داخلي في جسر الواتساب" });
+        }
     }
 });
 
@@ -704,9 +736,11 @@ app.post('/get-inventory', async (req, res) => {
         const messages = store.messages[jid] || [];
         const cleanInvoiceIds = [];
 
+        
+
         // 1. تحديد حدود التاريخ
-        const startTimestamp = startDate ? new Date(startDate).getTime() / 1000 : 0;
-        let endTimestamp = Infinity;
+        const startTimestamp = start_ts || 0;
+        const endTimestamp = end_ts || Infinity;
         if (endDate) {
             // 🔥 تمت استعادة الكود الخاص بك لضمان شمول آخر ثانية من اليوم
             const endD = new Date(endDate);
@@ -766,54 +800,68 @@ app.post('/get-inventory', async (req, res) => {
 // 📡 دالة الاستطلاع (The Probe): تعيد النطاق الزمني الفعلي المتوفر في الرام
 // 📡 دالة الاستطلاع (The Probe): تعيد النطاق الزمني الفعلي المتوفر في الرام
 app.post('/check-inventory-range', async (req, res) => {
-    const { phone, target_date } = req.body; // يتوقع YYYY-MM-DD
+    const { phone, start_ts, end_ts } = req.body; 
     
     try {
         const jid = getJid(phone);
         const messages = store.messages[jid] || [];
         
-        // حساب بداية ونهاية اليوم المطلوب بالثواني
-        const startOfDay = new Date(`${target_date}T00:00:00`).getTime() / 1000;
-        const endOfDay = new Date(`${target_date}T23:59:59.999`).getTime() / 1000;
-
         let minTs = Infinity;
         let maxTs = 0;
         let validCount = 0;
 
         messages.forEach(msg => {
-            let msgTime = (typeof msg.messageTimestamp === 'number') 
-                          ? msg.messageTimestamp 
-                          : (msg.messageTimestamp ? msg.messageTimestamp.low : 0);
+            // 🔥🔥 محرك استخراج التوقيت الذكي (يدعم History Sync + Live) 🔥🔥
+            let msgTime = 0;
+            if (typeof msg.messageTimestamp === 'number') {
+                msgTime = msg.messageTimestamp;
+            } else if (msg.messageTimestamp && typeof msg.messageTimestamp.low === 'number') {
+                msgTime = msg.messageTimestamp.low;
+            } else if (msg.messageTimestamp && typeof msg.messageTimestamp.toString === 'function') {
+                msgTime = parseInt(msg.messageTimestamp.toString(), 10);
+            }
+            
+            // محاولة الملاذ الأخير: البحث داخل الكائن المتداخل
+            if (msgTime === 0 && msg.message && msg.message.messageContextInfo) {
+               let ctxTime = msg.message.messageContextInfo.messageTimestamp;
+               if (typeof ctxTime === 'number') msgTime = ctxTime;
+               else if (ctxTime && typeof ctxTime.low === 'number') msgTime = ctxTime.low;
+            }
 
-            // إذا كانت الرسالة ضمن اليوم المطلوب وليست من البوت
-            if (msgTime >= startOfDay && msgTime <= endOfDay && !msg.key.fromMe) {
-                
-                // 🔥 [التعديل الأمني هنا]: استبعاد الأشباح الصريحة والأشباح الخفية (Stub 68)
-                const proto = msg.message?.protocolMessage;
-                const isRevoke = proto && (proto.type === 'REVOKE' || proto.type === 0);
-                const isStubGhost = msg.messageStubType === 68;
+            // إذا التقطنا توقيتاً صالحاً
+            if (msgTime > 0) {
+                if (msgTime >= start_ts && msgTime <= end_ts && !msg.key.fromMe) {
+                    const proto = msg.message?.protocolMessage;
+                    const isRevoke = proto && (proto.type === 'REVOKE' || proto.type === 0);
+                    const isStubGhost = msg.messageStubType === 68;
 
-                // نقبل الرسالة في حساب الوقت فقط إذا لم تكن محذوفة نهائياً
-                if (!isRevoke && !isStubGhost) {
-                    if (msgTime < minTs) minTs = msgTime;
-                    if (msgTime > maxTs) maxTs = msgTime;
-                    validCount++;
+                    if (!isRevoke && !isStubGhost) {
+                        if (msgTime < minTs) minTs = msgTime;
+                        if (msgTime > maxTs) maxTs = msgTime;
+                        validCount++;
+                    }
                 }
             }
         });
 
         if (validCount === 0) {
-            return res.json({ status: "empty", message: "لا توجد بيانات لهذا اليوم في ذاكرة الجسر" });
+            // لمعرفة ماذا قرأ السيرفر كأول وأخر رسالة، مفيد للديباغ
+            let realFirst = messages.length > 0 ? messages[0].messageTimestamp : "N/A";
+            let realLast = messages.length > 0 ? messages[messages.length-1].messageTimestamp : "N/A";
+            console.log(`⚠️ Check Range Failed. Wanted: ${start_ts}->${end_ts}. Have RAM limits: First:${JSON.stringify(realFirst)} Last:${JSON.stringify(realLast)}`);
+            
+            return res.json({ status: "empty", message: "لا توجد بيانات لهذا النطاق الزمني في ذاكرة الجسر" });
         }
 
         res.json({ 
             status: "success", 
             count: validCount,
-            min_timestamp: minTs, // أقدم رسالة حقيقية في الرام
-            max_timestamp: maxTs  // أحدث رسالة حقيقية في الرام
+            min_timestamp: minTs,
+            max_timestamp: maxTs 
         });
 
     } catch (error) {
+        console.error("Check Range Error:", error);
         res.status(500).json({ error: error.message });
     }
 });
