@@ -27,7 +27,7 @@ import fs from 'fs';
 import cors from 'cors';
 
 const PORT = 3000;
- const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://api.taxihon.com/webhook/';
+const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://api.taxihon.com/webhook/';
 
 //  const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://127.0.0.1:8000/webhook/';
 
@@ -388,6 +388,7 @@ async function startWhatsApp() {
 }
 
 // --- 📨 6. معالج الرسالة (المحدث لاستخراج الرقم بذكاء + حل مشاكل الحذف والتعديل) ---
+// --- 📨 6. معالج الرسالة (المحدث لاستخراج الرقم بذكاء + حل مشاكل الحذف والتعديل) ---
 async function processSingleMessage(msg, isSync = false) {
     const remoteJid = msg.key.remoteJid;
     const isGroup = remoteJid.endsWith('@g.us');
@@ -425,8 +426,9 @@ async function processSingleMessage(msg, isSync = false) {
             targetMsgId = proto.key?.id; 
             body = "[REVOKE]"; 
         } 
+        // 🚨🚨 الحل الحاسم هنا: إضافة MESSAGE_EDIT ليتعرف عليها الجسر 🚨🚨
         // حالة التعديل (Edit)
-        else if (proto.type === 'EDIT_MESSAGE' || proto.type === 14) {
+        else if (proto.type === 'EDIT_MESSAGE' || proto.type === 'MESSAGE_EDIT' || proto.type === 14) {
             eventType = 'message_edit';
             targetMsgId = proto.key?.id;
             body = proto.editedMessage?.conversation || 
@@ -446,18 +448,31 @@ async function processSingleMessage(msg, isSync = false) {
     }
 
     // تجاهل الرسائل الفارغة (إلا إذا كانت حذف أو تعديل)
+    // تجاهل الرسائل الفارغة (إذا كانت رسالة جديدة فقط)
     if ((!body || body.trim().length === 0) && eventType === 'new_message') return;
 
-    if (isSync) {
-        console.log(`✅ [SYNC] ${new Date(msg.messageTimestamp*1000).toLocaleDateString()} | ${body.substring(0, 30)}...`);
+    // تجهيز المعرفات للبايلود
+    let finalMsgId = msg.key.id;
+    let finalEventType = eventType;
+
+    // 🔥 الخدعة الذكية: أثناء المزامنة، نحول التعديل إلى رسالة جديدة لكي يحفظها جانغو كفاتورة أصلية
+    if (isSync && eventType === 'message_edit') {
+        finalMsgId = targetMsgId || msg.key.id; 
+        finalEventType = 'new_message'; 
+        console.log(`🔄 [SYNC MAGIC] تم تحويل التعديل لرسالة أصلية برقم: ${finalMsgId}`);
+    }
+
+    if (isSync && finalEventType === 'new_message') {
+        const timeStr = new Date(msg.messageTimestamp * 1000).toLocaleString('en-US', {timeZone: 'Asia/Damascus', hour12: false});
+        console.log(`✅ [SYNC] ${timeStr} | ${body.substring(0, 40)}...`);
     }
 
     // تجهيز البايلود الشامل لضمان وصول كل التفاصيل لـ Django
     let payload = {
-        event_type: eventType, 
+        event_type: finalEventType, 
         target_message_id: targetMsgId, 
         is_sync: isSync, 
-        whatsapp_message_id: msg.key.id, 
+        whatsapp_message_id: finalMsgId, 
         sender_id: senderId,
         
         // الحقول المحسنة لضمان الدقة مع الأرقام المشفرة
@@ -493,6 +508,17 @@ async function processSingleMessage(msg, isSync = false) {
         console.log(`📤 Live Event: ${eventType} | ID: ${msg.key.id} | Target: ${targetMsgId || 'None'}`);
         console.log(`   📞 Extracted: ${phone} | 🔢 RawID: ${participantRaw}`);
     }
+
+    // === 📸 كاميرا مراقبة رسائل التعديل (في الجسر) ===
+    if (eventType === 'message_edit' && !isSync) {
+        console.log(`\n✏️✏️✏️ [BRIDGE -> DJANGO] إرسال رسالة تعديل ✏️✏️✏️`);
+        console.log(`- رقم حدث التعديل: ${msg.key.id}`);
+        console.log(`- رقم الرسالة الأصلية (Target): ${targetMsgId}`);
+        console.log(`- هل هي من المزامنة؟: ${isSync}`);
+        console.log(`- النص الجديد: ${body.substring(0, 60)}...`);
+        console.log(`✏️✏️✏️✏️✏️✏️✏️✏️✏️✏️✏️✏️✏️✏️✏️✏️✏️✏️✏️\n`);
+    }
+    // ===============================================
     
     // الإرسال للسيرفر (Django Webhook)
     await sendToDjango(payload, msg.key);
@@ -595,24 +621,65 @@ app.get('/qr-code', async (req, res) => {
 // --- 🔌 7. الروابط الخارجية ---
 // أ) المزامنة القسرية (مع فلتر التاريخ الدقيق + فلتر الحذف الذكي 🗑️)
 // أ) المزامنة القسرية (النسخة النهائية والمحصنة - Diamond Edition)
+// أ) المزامنة القسرية (النسخة النهائية والمحصنة - V12 Diamond Edition)
+// أ) المزامنة القسرية (النسخة النهائية والمحصنة - V12 Diamond Edition مع محرك التشخيص الزمني)
 app.post('/force-sync', async (req, res) => {
-    // 1. استلام وتأمين المتغيرات (Safe Type Casting)
-    const { phone, limit, start_ts, end_ts } = req.body;
+    // 1. استلام كل الصيغ المحتملة للتواريخ (القديمة من السيلري والحديثة من الواجهة)
+    const { phone, limit, start_ts, end_ts, startDate, endDate } = req.body;
     
-    // ضمان أن التواريخ القادمة هي أرقام (Numbers) وليست نصوصاً (Strings)
-    const safeStartTs = start_ts ? Number(start_ts) : null;
-    const safeEndTs = end_ts ? Number(end_ts) : null;
+    // 🔥 بناء التوقيت الآمن (المترجم المزدوج للثواني المطلقة) 🔥
+    let safeStartTs = null;
+    let safeEndTs = null;
+
+    if (start_ts && end_ts) {
+        // إذا استلمنا ثواني مطلقة من الواجهة الجديدة
+        safeStartTs = Number(start_ts);
+        safeEndTs = Number(end_ts);
+    } else if (startDate) {
+        // إذا استلمنا نصوصاً من السيلري أو المهام المجدولة (نفرض توقيت دمشق إجبارياً)
+        const startD = new Date(`${startDate}T00:00:00+03:00`);
+        safeStartTs = Math.floor(startD.getTime() / 1000);
+        
+        if (endDate) {
+            const endD = new Date(`${endDate}T23:59:59+03:00`);
+            safeEndTs = Math.floor(endD.getTime() / 1000);
+        } else {
+            safeEndTs = Math.floor(Date.now() / 1000); 
+        }
+    }
+    
+    // ==============================================================
+    // 🕵️‍♂️ [TIME X-RAY] أشعة سينية للزمن لمعرفة أين تضيع الفواتير 
+    // ==============================================================
+    const formatTime = (ts) => ts ? new Date(ts * 1000).toLocaleString('en-US', {timeZone: 'Asia/Damascus', hour12: false}) : 'N/A';
+    
+    console.log(`\n` + `⏳`.repeat(20));
+    console.log(`🎯 [SYNC COMMAND RECEIVED]`);
+    console.log(`   ➡️ Start Target: ${safeStartTs} => (${formatTime(safeStartTs)})`);
+    console.log(`   ➡️ End Target:   ${safeEndTs} => (${formatTime(safeEndTs)})`);
+    // ==============================================================
     
     try {
         const jid = getJid(phone);
         const messages = store.messages[jid]; 
 
         const totalAvailable = messages ? messages.length : 0;
-        console.log(`🧐 [DEBUG] RAM Messages: ${totalAvailable}`);
-
+        
         if (!messages || totalAvailable === 0) {
+            console.log(`   ❌ RAM is Empty for this group.`);
             return res.json({ status: "empty", message: "الأرشيف فارغ في الذاكرة." });
         }
+
+        // جلب توقيت أول وآخر رسالة في الذاكرة لفحص الانحراف
+        let firstMsgTs = messages[0]?.messageTimestamp;
+        let lastMsgTs = messages[messages.length - 1]?.messageTimestamp;
+        let tFirst = typeof firstMsgTs === 'number' ? firstMsgTs : (firstMsgTs?.low || 0);
+        let tLast = typeof lastMsgTs === 'number' ? lastMsgTs : (lastMsgTs?.low || 0);
+
+        console.log(`   📊 RAM Contains: ${totalAvailable} Messages`);
+        console.log(`   ⏮️ Oldest in RAM: ${tFirst} => (${formatTime(tFirst)})`);
+        console.log(`   ⏭️ Newest in RAM: ${tLast} => (${formatTime(tLast)})`);
+        console.log(`⏳`.repeat(20) + `\n`);
 
         // --- 🗑️ 2. بناء قائمة المحذوفات الشاملة (Blacklist) بصرامة ---
         const revokedIds = new Set();
@@ -633,31 +700,69 @@ app.post('/force-sync', async (req, res) => {
         }
 
         // --- ⚙️ 3. الفلترة والتجهيز (The Core Engine) ---
+        let skippedDueToTime = 0; 
+        let editsChecked = 0;
+        
         let msgsToSync = messages.filter(m => {
-            // 1. استبعاد الأشباح والمحذوفات فوراً
-            if (m.message?.protocolMessage) return false;
+            // أ. استبعاد الأشباح والمحذوفات فوراً
             if (m.messageStubType === 68) return false;
             if (m.key && revokedIds.has(m.key.id)) return false;
 
-            // 2. التأكد من وجود نص حقيقي وفعلي (استبعاد الرسائل الفارغة والميديا الصامتة)
-            const text = m.message?.conversation || 
-                         m.message?.extendedTextMessage?.text || 
-                         m.message?.imageMessage?.caption || "";
-            
-            if (!text || text.trim().length < 15) return false;
+            let isEdit = false;
+            let targetId = null;
+            let text = "";
 
-            // 🔥 3. الفلتر الزمني المطلق (الحل الجذري لمشكلة تخطي الفواتير) 🔥
-            // 🔥 3. الفلتر الزمني المطلق (المدعوم باستخراج التوقيت العميق) 🔥
+            // 🚨 كاسحة الألغام: البحث عن التعديل في كل مسارات Baileys المحتملة 🚨
+            const proto = m.message?.protocolMessage;
+            const directEdit = m.message?.editedMessage; // بعض نسخ Baileys تضعها هنا مباشرة
+            
+            if (proto) {
+                const pType = proto.type;
+                // طباعة أي بروتوكول غريب لمعرفة كيف يخزن واتساب التعديلات
+                if (pType !== 0 && pType !== 'REVOKE') {
+                    console.log(`👽 [ALIEN PROTOCOL] Found Type: ${pType} | ID: ${m.key?.id}`);
+                }
+
+                if (pType === 14 || pType === 'EDIT_MESSAGE' || pType === 'MESSAGE_EDIT') {
+                    isEdit = true;
+                    targetId = proto.key?.id;
+                    const editedMsg = proto.editedMessage;
+                    if (editedMsg) {
+                        text = editedMsg.conversation || editedMsg.extendedTextMessage?.text || editedMsg.imageMessage?.caption || "";
+                    }
+                } else {
+                    return false; // بروتوكول آخر غير التعديل (يُرفض)
+                }
+            } else if (directEdit) {
+                // حالة نادرة: التعديل مخزن مباشرة بدون بروتوكول
+                isEdit = true;
+                targetId = m.key?.id; // هنا يكون الـ ID هو نفسه
+                text = directEdit.message?.protocolMessage?.editedMessage?.conversation || directEdit.conversation || "";
+            } else {
+                // رسالة عادية
+                text = m.message?.conversation || 
+                       m.message?.extendedTextMessage?.text || 
+                       m.message?.imageMessage?.caption || "";
+            }
+
+            if (isEdit) {
+                editsChecked++;
+                console.log(`\n🔍 [EDIT FOUND] رسالة تعديل وُجدت! الأصل: ${targetId}`);
+                console.log(`   - النص الجديد: "${text.substring(0, 30)}..."`);
+            }
+            
+            // د. فلتر الطول (5 أحرف كما اتفقنا)
+            if (!text || text.trim().length < 5) {
+                if (isEdit) console.log(`   ❌ [DROP] رُفضت! النص فارغ.`);
+                return false;
+            }
+
+            // هـ. الفلتر الزمني (المعدل لاصطياد التعديلات المتأخرة)
             if (safeStartTs && safeEndTs) {
                 let msgTime = 0;
-                
-                if (typeof m.messageTimestamp === 'number') {
-                    msgTime = m.messageTimestamp;
-                } else if (m.messageTimestamp && typeof m.messageTimestamp.low === 'number') {
-                    msgTime = m.messageTimestamp.low;
-                } else if (m.messageTimestamp && typeof m.messageTimestamp.toString === 'function') {
-                    msgTime = parseInt(m.messageTimestamp.toString(), 10);
-                }
+                if (typeof m.messageTimestamp === 'number') msgTime = m.messageTimestamp;
+                else if (m.messageTimestamp && typeof m.messageTimestamp.low === 'number') msgTime = m.messageTimestamp.low;
+                else if (m.messageTimestamp && typeof m.messageTimestamp.toString === 'function') msgTime = parseInt(m.messageTimestamp.toString(), 10);
                 
                 if (msgTime === 0 && m.message && m.message.messageContextInfo) {
                    let ctxTime = m.message.messageContextInfo.messageTimestamp;
@@ -667,11 +772,25 @@ app.post('/force-sync', async (req, res) => {
 
                 if (msgTime === 0) return false;
 
-                return msgTime >= safeStartTs && msgTime <= safeEndTs;
+                const isInRange = msgTime >= safeStartTs && msgTime <= safeEndTs;
+                
+                if (!isInRange) {
+                    skippedDueToTime++;
+                    // ⚠️ إذا كان تعديلاً ووقع خارج النطاق، سنطبعه لنعرف كم تأخر!
+                    if (isEdit) {
+                        const timeStr = new Date(msgTime * 1000).toLocaleString('en-US', {timeZone: 'Asia/Damascus', hour12: false});
+                        console.log(`   ❌ [DROP EDIT] رُفض التعديل بسبب الوقت! وقت التعديل: ${timeStr} | الحد المسموح: ${new Date(safeEndTs * 1000).toLocaleString('en-US', {timeZone: 'Asia/Damascus', hour12: false})}`);
+                    }
+                }
+
+                return isInRange;
             }
             
             return true;
         });
+
+        console.log(`   ✂️ Dropped due to Time Filter: ${skippedDueToTime} messages.`);
+        console.log(`   ✏️ Total Edits Successfully Evaluated: ${editsChecked}`);
 
         // --- 📏 4. تطبيق حدود العدد (إذا لم يتم استخدام التاريخ) ---
         if (!safeStartTs) {
@@ -724,61 +843,64 @@ app.post('/force-sync', async (req, res) => {
     }
 });
 
-// ج) الجرد المبني على حالة الواتساب الحالية (State-based Inventory)
-// ج) الجرد بنظام "الفلاج" (Mark-and-Sweep Inventory)
-// ج) الجرد المبني على حالة الواتساب الحالية (State-based Inventory)
+
 // ج) الجرد بنظام "الفلاج" (Mark-and-Sweep Inventory)
 app.post('/get-inventory', async (req, res) => {
-    const { phone, startDate, endDate } = req.body;
+    // استقبال كل الصيغ
+    const { phone, startDate, endDate, start_ts, end_ts } = req.body;
     
     try {
         const jid = getJid(phone);
         const messages = store.messages[jid] || [];
         const cleanInvoiceIds = [];
 
-        
+        // 🔥 توحيد التوقيت (نفس محرك Force Sync)
+        let safeStartTs = 0;
+        let safeEndTs = Infinity;
 
-        // 1. تحديد حدود التاريخ
-        const startTimestamp = start_ts || 0;
-        const endTimestamp = end_ts || Infinity;
-        if (endDate) {
-            // 🔥 تمت استعادة الكود الخاص بك لضمان شمول آخر ثانية من اليوم
-            const endD = new Date(endDate);
-            endD.setHours(23, 59, 59, 999);
-            endTimestamp = endD.getTime() / 1000;
+        if (start_ts && end_ts) {
+            safeStartTs = Number(start_ts);
+            safeEndTs = Number(end_ts);
+        } else if (startDate) {
+            const startD = new Date(`${startDate}T00:00:00+03:00`);
+            safeStartTs = Math.floor(startD.getTime() / 1000);
+            if (endDate) {
+                const endD = new Date(`${endDate}T23:59:59+03:00`);
+                safeEndTs = Math.floor(endD.getTime() / 1000);
+            }
         }
 
-        // 2. بناء قائمة المحذوفات الشاملة لاستبعادها
         const revokedIds = new Set();
         messages.forEach(msg => {
             const proto = msg.message?.protocolMessage;
             if (proto && (proto.type === 'REVOKE' || proto.type === 0)) {
                 if (proto.key && proto.key.id) revokedIds.add(proto.key.id);
             }
-            // 👻 صيد الأشباح
             if (msg.messageStubType === 68 && msg.key && msg.key.id) {
                 revokedIds.add(msg.key.id);
             }
         });
 
-        // 3. بناء القائمة النظيفة (فواتير فقط، ضمن التاريخ، غير محذوفة)
         messages.forEach(msg => {
             if (msg.key && msg.key.id) {
-                let msgTime = (typeof msg.messageTimestamp === 'number') 
-                              ? msg.messageTimestamp 
-                              : (msg.messageTimestamp ? msg.messageTimestamp.low : 0);
+                let msgTime = 0;
+                if (typeof msg.messageTimestamp === 'number') {
+                    msgTime = msg.messageTimestamp;
+                } else if (msg.messageTimestamp && typeof msg.messageTimestamp.low === 'number') {
+                    msgTime = msg.messageTimestamp.low;
+                } else if (msg.messageTimestamp && typeof msg.messageTimestamp.toString === 'function') {
+                    msgTime = parseInt(msg.messageTimestamp.toString(), 10);
+                }
 
-                if (msgTime >= startTimestamp && msgTime <= endTimestamp) {
+                if (msgTime >= safeStartTs && msgTime <= safeEndTs) {
                     const isProtocol = !!msg.message?.protocolMessage;
-                    const isFromMe = msg.key.fromMe;
-                    const isStubGhost = msg.messageStubType === 68; // 🛡️ حماية الأشباح
+                    const isStubGhost = msg.messageStubType === 68;
                     
-                    if (!isProtocol && !isFromMe && !isStubGhost && !revokedIds.has(msg.key.id)) {
+                    if (!isProtocol && !msg.key.fromMe && !isStubGhost && !revokedIds.has(msg.key.id)) {
                         const text = msg.message?.conversation || 
                                      msg.message?.extendedTextMessage?.text || 
                                      msg.message?.imageMessage?.caption || "";
                         
-                        // فلتر الفواتير + التأكد من طول النص لمنع مرور الأشباح
                         const isInvoiceLike = /فاتور|اجر|أجر|توصيل|تعويض|غرام|مخالف|كابتن|سائق|مندوب|منسق|كونترول|كنترول/i.test(text);
                         if (isInvoiceLike && text.length > 15) {
                             cleanInvoiceIds.push(msg.key.id.toUpperCase());
@@ -788,7 +910,6 @@ app.post('/get-inventory', async (req, res) => {
             }
         });
 
-        console.log(`✅ [Inventory] Dates: ${startDate} -> ${endDate} | Clean Sent: ${cleanInvoiceIds.length}`);
         res.json({ status: "success", clean_ids: cleanInvoiceIds });
 
     } catch (error) {
@@ -1081,7 +1202,43 @@ app.post('/debug-message', async (req, res) => {
 });
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
+// 🔬 أداة البحث المجهري في الذاكرة (لكشف الرسائل المفقودة)
+app.post('/search-ram', (req, res) => {
+    const { search_text } = req.body;
+    if (!search_text) return res.json({ error: "أرسل نصاً للبحث" });
 
+    let found_messages = [];
+    
+    // البحث الشامل في كل المجموعات والرسائل في الذاكرة
+    for (const jid in store.messages) {
+        store.messages[jid].forEach(m => {
+            const body = m.message?.conversation || 
+                         m.message?.extendedTextMessage?.text || 
+                         m.message?.imageMessage?.caption || "";
+            
+            if (body.includes(search_text)) {
+                // استخراج التوقيت الفعلي للرسالة كما يراها السيرفر
+                let msgTime = 0;
+                if (typeof m.messageTimestamp === 'number') msgTime = m.messageTimestamp;
+                else if (m.messageTimestamp?.low) msgTime = m.messageTimestamp.low;
+                else if (m.messageTimestamp) msgTime = parseInt(m.messageTimestamp.toString(), 10);
+
+                found_messages.push({
+                    id: m.key?.id,
+                    time_epoch: msgTime,
+                    time_syria: msgTime ? new Date(msgTime * 1000).toLocaleString('en-US', {timeZone: 'Asia/Damascus'}) : 'N/A',
+                    text: body.substring(0, 100) + "..."
+                });
+            }
+        });
+    }
+
+    res.json({
+        total_in_ram: Object.values(store.messages).reduce((acc, curr) => acc + curr.length, 0),
+        found_count: found_messages.length,
+        results: found_messages
+    });
+});
 (async () => {
     await startWhatsApp();
     app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Bridge Running on ${PORT}`));
