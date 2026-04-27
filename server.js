@@ -31,7 +31,11 @@ app.use(express.json({ limit: '50mb' }));
 // ==============================================================
 // 🗄️ 1. إعداد قاعدة البيانات (SQLite WAL Mode)
 // ==============================================================
-const db = new Database('taxihon_archive.db');
+// إنشاء مجلد للداتا إذا لم يكن موجوداً (لضمان الصلاحيات)
+const DATA_DIR = './data';
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+
+const db = new Database(`${DATA_DIR}/taxihon_archive.db`);
 db.pragma('journal_mode = WAL'); // السحر: قراءة وكتابة متزامنة بدون قفل
 
 // إنشاء الجداول
