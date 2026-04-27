@@ -16,8 +16,10 @@ import fs from 'fs';
 import cors from 'cors';
 import Database from 'better-sqlite3'; // 👈 محرك الداتابيز الجديد
 
-const PORT = 4000;
+const PORT = 3000;
 const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://api.taxihon.com/webhook/';
+// const PORT = 4000;
+
 // const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://127.0.0.1:8000/webhook/';
 const SESSION_DIR = 'auth_info_baileys'; 
 const ADMIN_BOT_NUMBERS = ['963931698698', '963931697697'];
