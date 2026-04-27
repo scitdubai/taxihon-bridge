@@ -57,12 +57,13 @@ const deleteOldChats = db.prepare('DELETE FROM messages WHERE is_invoice = 0 AND
 const deleteOldInvoices = db.prepare('DELETE FROM messages WHERE is_invoice = 1 AND timestamp < ?');
 
 // دالة التنظيف الآلي (Garbage Collector)
+// دالة التنظيف الآلي (Garbage Collector) - تم الإصلاح
 function runDbCleanup() {
     const now = Math.floor(Date.now() / 1000);
-    const twoDaysAgo = now - (48 * 60 * 60);
     const thirtyFiveDaysAgo = now - (35 * 24 * 60 * 60);
 
-    const chatsDeleted = deleteOldChats.run(twoDaysAgo).changes;
+    // 🔥 تم توحيد مدة الحفظ لـ 35 يوماً لجميع الرسائل لحماية المزامنة والتعديلات
+    const chatsDeleted = deleteOldChats.run(thirtyFiveDaysAgo).changes;
     const invoicesDeleted = deleteOldInvoices.run(thirtyFiveDaysAgo).changes;
     
     if (chatsDeleted > 0 || invoicesDeleted > 0) {
@@ -100,13 +101,14 @@ const extractPhoneNumber = (jid) => { /* ... نفس الدالة السابقة 
 };
 
 // المعالج المتوازي لجانغو
+// المعالج المتوازي لجانغو - تم الإصلاح لمنع الـ DDoS
 const processMessageQueue = async () => {
     if (isProcessingMessages || messageQueue.length === 0) return;
     isProcessingMessages = true;
     while (messageQueue.length > 0) {
-        const batch = messageQueue.splice(0, 10);
-        await Promise.all(batch.map(item => sendToDjango(item.payload, item.key, true)));
-        await delay(100); 
+        const item = messageQueue.shift(); // نأخذ رسالة واحدة فقط
+        await sendToDjango(item.payload, item.key, true);
+        await delay(50); // استراحة 50ms بين كل رسالة (أمان تام لجانغو)
     }
     isProcessingMessages = false;
 };
@@ -135,8 +137,9 @@ async function sendToDjango(payload, msgKey = null, isFromQueue = false) {
             }
         }
     } catch (error) {
-        // 🔥 إضافة الطباعة هنا لكي نرى سبب عدم الوصول لجانغو
-        console.error(`❌ [Django Error] Failed to send invoice: ${error.message} | URL: ${DJANGO_WEBHOOK_URL}`);
+        // 🔥 طباعة التفاصيل الدقيقة القادمة من جانغو بدلاً من رسالة عامة
+        const djangoReason = error.response?.data?.error || error.response?.data?.message || error.message;
+        console.error(`❌ [Django Error] Failed: ${djangoReason} | Status: ${error.response?.status}`);
         
         if (!isFromQueue && !payload.is_sync) { 
             messageQueue.push({ payload, key: msgKey });
