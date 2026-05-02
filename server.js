@@ -165,14 +165,14 @@ async function startWhatsApp() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // 👈 2. هذا هو المحرك الذي يسحب البيانات القديمة عند ربط الواتساب
-    sock.ev.on('messaging-history.set', async ({ messages }) => {
-        console.log(`📥 [History Event] Received bulk historical data from phone...`);
-        
-        if (!messages) return;
+    // =========================================================
+    // 📥 2. المحرك الساحب للتاريخ (History Sync Engine V2)
+    // =========================================================
+    // دالة مساعدة لحفظ الرسائل التاريخية في SQLite
+    const saveHistoricalMessages = (messagesList, logPrefix) => {
+        if (!messagesList || messagesList.length === 0) return;
 
         let count = 0;
-        // نستخدم transaction لتسريع إدخال آلاف الرسائل لقاعدة البيانات بلمح البصر
         const insertMany = db.transaction((msgs) => {
             for (const msg of msgs) {
                 const messageObj = msg.message ? msg : (msg.messageStubType ? null : msg);
@@ -220,12 +220,36 @@ async function startWhatsApp() {
                 try {
                     insertMsg.run(messageObj.key.id, remoteJid, msgTime, isInvoice, JSON.stringify(payload));
                     count++;
-                } catch (e) { /* تجاهل المكرر */ }
+                } catch (e) { /* تجاهل المكرر بصمت */ }
             }
         });
 
-        insertMany(messages);
-        console.log(`📚 [History] Successfully saved ${count} historical messages to SQLite DB.`);
+        insertMany(messagesList);
+        if (count > 0) {
+            console.log(`📚 [${logPrefix}] Successfully saved ${count} historical messages to SQLite DB.`);
+        }
+    };
+
+    // أ) الاستماع للحدث الأولي السريع
+    sock.ev.on('messaging-history.set', async ({ messages }) => {
+        saveHistoricalMessages(messages, "History.Set Initial");
+    });
+
+    // ب) 🔥 هذا هو الحل الجذري (الاستماع للتحديثات التاريخية العميقة) 🔥
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        // إذا كان نوع الرسائل 'append' أو كانت تاريخية (وهي الطريقة الجديدة لواتساب لضخ التاريخ)
+        if (type === 'append') {
+             saveHistoricalMessages(messages, "History.Append Chunk");
+        } 
+        else if (type === 'notify') {
+            for (const msg of messages) {
+                try {
+                    if (msg.message?.messageContextInfo) delete msg.message.messageContextInfo;
+                    if (msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
+                    processSingleMessage(msg, false); 
+                } catch (err) {}
+            }
+        } 
     });
 
     sock.ev.on('connection.update', async (update) => {
