@@ -1,11 +1,11 @@
 /**
- * TaxiHon Bridge - V12 Titanium Edition 💎
- * Status: HIGH LOAD OPTIMIZED & SQLITE WAL ENABLED
+ * TaxiHon Bridge - V13 Titanium Edition 💎 (Anti-Ghost & Sync-Proof)
+ * Status: HIGH LOAD OPTIMIZED, SQLITE WAL ENABLED, REVOKE-CATCHER ACTIVE
  */
 
 import { 
     default as makeWASocket, useMultiFileAuthState, DisconnectReason, 
-    fetchLatestBaileysVersion, downloadMediaMessage, delay, makeCacheableSignalKeyStore
+    fetchLatestBaileysVersion, delay, makeCacheableSignalKeyStore
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import pino from 'pino';
@@ -14,12 +14,10 @@ import axios from 'axios';
 import qrcodeTerminal from 'qrcode-terminal';
 import fs from 'fs';
 import cors from 'cors';
-import Database from 'better-sqlite3'; // 👈 محرك الداتابيز الجديد
+import Database from 'better-sqlite3';
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'https://api.taxihon.com/webhook/';
-// const PORT = 4000;
-
 // const DJANGO_WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://127.0.0.1:8000/webhook/';
 const SESSION_DIR = 'auth_info_baileys'; 
 const ADMIN_BOT_NUMBERS = ['963931698698', '963931697697'];
@@ -31,14 +29,12 @@ app.use(express.json({ limit: '50mb' }));
 // ==============================================================
 // 🗄️ 1. إعداد قاعدة البيانات (SQLite WAL Mode)
 // ==============================================================
-// إنشاء مجلد للداتا إذا لم يكن موجوداً (لضمان الصلاحيات)
 const DATA_DIR = './data';
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 
 const db = new Database(`${DATA_DIR}/taxihon_archive.db`);
-db.pragma('journal_mode = WAL'); // السحر: قراءة وكتابة متزامنة بدون قفل
+db.pragma('journal_mode = WAL');
 
-// إنشاء الجداول
 db.exec(`
     CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY,
@@ -56,13 +52,10 @@ const getMsgsByDate = db.prepare('SELECT payload_json FROM messages WHERE jid = 
 const deleteOldChats = db.prepare('DELETE FROM messages WHERE is_invoice = 0 AND timestamp < ?');
 const deleteOldInvoices = db.prepare('DELETE FROM messages WHERE is_invoice = 1 AND timestamp < ?');
 
-// دالة التنظيف الآلي (Garbage Collector)
-// دالة التنظيف الآلي (Garbage Collector) - تم الإصلاح
 function runDbCleanup() {
     const now = Math.floor(Date.now() / 1000);
     const thirtyFiveDaysAgo = now - (35 * 24 * 60 * 60);
 
-    // 🔥 تم توحيد مدة الحفظ لـ 35 يوماً لجميع الرسائل لحماية المزامنة والتعديلات
     const chatsDeleted = deleteOldChats.run(thirtyFiveDaysAgo).changes;
     const invoicesDeleted = deleteOldInvoices.run(thirtyFiveDaysAgo).changes;
     
@@ -70,10 +63,10 @@ function runDbCleanup() {
         console.log(`🧹 [DB Cleanup] Deleted ${chatsDeleted} old chats, ${invoicesDeleted} old invoices.`);
     }
 }
-setInterval(runDbCleanup, 60 * 60 * 1000); // تنظيف كل ساعة
+setInterval(runDbCleanup, 60 * 60 * 1000);
 
 // ==============================================================
-// 🧠 2. إدارة الطوابير المتوازية (Concurrent Queues)
+// 🧠 2. دوال مساعدة ومحرك الاستخراج الذكي (The Extraction Engine)
 // ==============================================================
 let sock;
 let isWaConnected = false;
@@ -84,7 +77,7 @@ let isProcessingReactions = false;
 let currentQR = null;
 let reconnectAttempts = 0;
 
-const getJid = (number) => { /* ... نفس الدالة السابقة ... */ 
+const getJid = (number) => { 
     if (!number) return null;
     let clean = String(number).replace(/\D/g, '');
     if (String(number).includes('@')) return number;
@@ -93,22 +86,63 @@ const getJid = (number) => { /* ... نفس الدالة السابقة ... */
     return `${clean}@s.whatsapp.net`;
 };
 const cleanId = (jid) => jid ? jid.split('@')[0].split(':')[0] : null;
-const extractPhoneNumber = (jid) => { /* ... نفس الدالة السابقة ... */ 
+const extractPhoneNumber = (jid) => { 
     if (!jid) return null;
     const cleanJid = jid.split('@')[0].split(':')[0];
-    if (jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid')) return cleanJid;
     return cleanJid;
 };
 
-// المعالج المتوازي لجانغو
-// المعالج المتوازي لجانغو - تم الإصلاح لمنع الـ DDoS
+/**
+ * 🔥 الضربة القاضية: محرك استخراج شامل يلتقط الحذف والتعديل 
+ * حتى لو كان قادماً من الـ History (Stubs)
+ */
+function extractMessageDetails(msg) {
+    let eventType = 'new_message';
+    let targetMsgId = null;
+    let body = "";
+
+    // 1. التقاط الحذف القادم من المزامنة التاريخية (Stubs)
+    // 2 = REVOKE, 68 = REVOKE_MESSAGE
+    if (msg.messageStubType === 2 || msg.messageStubType === 68) {
+        return {
+            eventType: 'message_revoke',
+            targetMsgId: msg.messageStubParameters?.[0] || msg.key.id,
+            body: "[REVOKE_STUB]"
+        };
+    }
+
+    const messageContent = msg.message;
+    if (!messageContent) return { eventType, targetMsgId, body };
+
+    const proto = messageContent.protocolMessage;
+    if (proto) {
+        // 0 = REVOKE في الواتساب الحديث
+        if (proto.type === 'REVOKE' || proto.type === 0 || proto.type === 1) {
+            eventType = 'message_revoke';
+            targetMsgId = proto.key?.id;
+            body = "[REVOKE]";
+        } else if (proto.type === 'EDIT_MESSAGE' || proto.type === 'MESSAGE_EDIT' || proto.type === 14) {
+            eventType = 'message_edit';
+            targetMsgId = proto.key?.id;
+            body = proto.editedMessage?.conversation || proto.editedMessage?.extendedTextMessage?.text || ""; 
+        }
+    } else {
+        body = messageContent.conversation || messageContent.extendedTextMessage?.text || messageContent.imageMessage?.caption || "";
+    }
+
+    return { eventType, targetMsgId, body };
+}
+
+// ==============================================================
+// 🚦 3. إدارة الطوابير المتوازية 
+// ==============================================================
 const processMessageQueue = async () => {
     if (isProcessingMessages || messageQueue.length === 0) return;
     isProcessingMessages = true;
     while (messageQueue.length > 0) {
-        const item = messageQueue.shift(); // نأخذ رسالة واحدة فقط
+        const item = messageQueue.shift();
         await sendToDjango(item.payload, item.key, true);
-        await delay(50); // استراحة 50ms بين كل رسالة (أمان تام لجانغو)
+        await delay(50); 
     }
     isProcessingMessages = false;
 };
@@ -137,7 +171,6 @@ async function sendToDjango(payload, msgKey = null, isFromQueue = false) {
             }
         }
     } catch (error) {
-        // 🔥 طباعة التفاصيل الدقيقة القادمة من جانغو بدلاً من رسالة عامة
         const djangoReason = error.response?.data?.error || error.response?.data?.message || error.message;
         console.error(`❌ [Django Error] Failed: ${djangoReason} | Status: ${error.response?.status}`);
         
@@ -149,7 +182,7 @@ async function sendToDjango(payload, msgKey = null, isFromQueue = false) {
 }
 
 // ==============================================================
-// 🔌 3. الاتصال ومعالجة الرسائل
+// 🔌 4. الاتصال ومعالجة الرسائل
 // ==============================================================
 async function startWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
@@ -165,60 +198,49 @@ async function startWhatsApp() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // =========================================================
-    // 📥 2. المحرك الساحب للتاريخ (History Sync Engine V2)
-    // =========================================================
-    // دالة مساعدة لحفظ الرسائل التاريخية في SQLite
     const saveHistoricalMessages = (messagesList, logPrefix) => {
         if (!messagesList || messagesList.length === 0) return;
 
         let count = 0;
         const insertMany = db.transaction((msgs) => {
             for (const msg of msgs) {
-                const messageObj = msg.message ? msg : (msg.messageStubType ? null : msg);
-                if (!messageObj || !messageObj.key) continue;
+                if (!msg || !msg.key) continue;
 
-                const remoteJid = messageObj.key.remoteJid;
+                const remoteJid = msg.key.remoteJid;
                 if (!remoteJid || msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
 
                 const isGroup = remoteJid.endsWith('@g.us');
-                let participantRaw = messageObj.key.participant || remoteJid;
+                let participantRaw = msg.key.participant || remoteJid;
                 let phone = extractPhoneNumber(participantRaw);
                 if (!isGroup && !phone) phone = extractPhoneNumber(remoteJid);
                 const senderId = cleanId(remoteJid); 
 
                 if (ADMIN_BOT_NUMBERS.includes(senderId)) continue;
 
-                // استخراج النص
-                let body = "";
-                const mContent = messageObj.message;
-                if (mContent) {
-                    body = mContent.conversation || mContent.extendedTextMessage?.text || mContent.imageMessage?.caption || "";
-                    const proto = mContent.protocolMessage;
-                    if (proto && (proto.type === 'EDIT_MESSAGE' || proto.type === 'MESSAGE_EDIT' || proto.type === 14)) {
-                        body = proto.editedMessage?.conversation || proto.editedMessage?.extendedTextMessage?.text || ""; 
-                    }
-                }
+                // 🔥 استخدام المحرك الجراحي للاستخراج
+                const { eventType, targetMsgId, body } = extractMessageDetails(msg);
 
-                if (!body || body.trim().length === 0) continue;
+                // نتجاهل الرسائل الفارغة التي ليست حذفاً
+                if ((!body || body.trim().length === 0) && eventType === 'new_message') continue;
 
-                // استخراج التوقيت
-                let msgTime = messageObj.messageTimestamp;
+                let msgTime = msg.messageTimestamp;
                 if (typeof msgTime !== 'number') msgTime = msgTime?.low || Math.floor(Date.now() / 1000);
 
                 let payload = {
-                    event_type: 'new_message', target_message_id: null, is_sync: true, 
-                    whatsapp_message_id: messageObj.key.id, sender_id: senderId, participant_phone: phone,          
-                    participant_raw: participantRaw, pushName: messageObj.pushName || "",     
+                    event_type: eventType, target_message_id: targetMsgId, is_sync: true, 
+                    whatsapp_message_id: msg.key.id, sender_id: senderId, participant_phone: phone,         
+                    participant_raw: participantRaw, pushName: msg.pushName || "",     
                     group_id: isGroup ? remoteJid : null, author_id: isGroup ? participantRaw : null,
                     is_group: isGroup, message_text: body, timestamp: msgTime
                 };
 
+                // 🛡️ الحماية الكبرى: نعتبر أي "تعديل" أو "حذف" كأنه فاتورة (is_invoice = 1)
+                // لكي تجلبه المزامنة (/force-sync) ويقوم جانغو بحذفه/تعديله فوراً
                 const isInvoiceLike = /فاتور|اجر|أجر|توصيل|تعويض|غرام|مخالف|كابتن|سائق|مندوب|منسق/i.test(body);
-                const isInvoice = (isInvoiceLike && body.length > 15) ? 1 : 0;
+                const isInvoice = (isInvoiceLike && body.length > 15) || eventType === 'message_revoke' || eventType === 'message_edit' ? 1 : 0;
 
                 try {
-                    insertMsg.run(messageObj.key.id, remoteJid, msgTime, isInvoice, JSON.stringify(payload));
+                    insertMsg.run(msg.key.id, remoteJid, msgTime, isInvoice, JSON.stringify(payload));
                     count++;
                 } catch (e) { /* تجاهل المكرر بصمت */ }
             }
@@ -230,14 +252,11 @@ async function startWhatsApp() {
         }
     };
 
-    // أ) الاستماع للحدث الأولي السريع
     sock.ev.on('messaging-history.set', async ({ messages }) => {
         saveHistoricalMessages(messages, "History.Set Initial");
     });
 
-    // ب) 🔥 هذا هو الحل الجذري (الاستماع للتحديثات التاريخية العميقة) 🔥
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        // إذا كان نوع الرسائل 'append' أو كانت تاريخية (وهي الطريقة الجديدة لواتساب لضخ التاريخ)
         if (type === 'append') {
              saveHistoricalMessages(messages, "History.Append Chunk");
         } 
@@ -273,18 +292,6 @@ async function startWhatsApp() {
             processMessageQueue(); processReactionQueue();
         }
     });
-
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type === 'notify') {
-            for (const msg of messages) {
-                try {
-                    if (msg.message?.messageContextInfo) delete msg.message.messageContextInfo;
-                    if (msg.key.fromMe || msg.key.remoteJid === 'status@broadcast') continue;
-                    processSingleMessage(msg, false); 
-                } catch (err) {}
-            }
-        } 
-    });
 }
 
 async function processSingleMessage(msg, isSync = false) {
@@ -296,106 +303,59 @@ async function processSingleMessage(msg, isSync = false) {
     const senderId = cleanId(remoteJid); 
 
     if (ADMIN_BOT_NUMBERS.includes(senderId)) return;
-    const messageContent = msg.message;
-    if (!messageContent) return;
 
-    const proto = messageContent.protocolMessage;
-    let eventType = 'new_message';
-    let targetMsgId = null;
-    let body = "";
-
-    if (proto) {
-        if (proto.type === 'REVOKE' || proto.type === 0) {
-            eventType = 'message_revoke'; targetMsgId = proto.key?.id; body = "[REVOKE]"; 
-        } else if (proto.type === 'EDIT_MESSAGE' || proto.type === 'MESSAGE_EDIT' || proto.type === 14) {
-            eventType = 'message_edit'; targetMsgId = proto.key?.id;
-            body = proto.editedMessage?.conversation || proto.editedMessage?.extendedTextMessage?.text || ""; 
-        }
-    }
-
-    if ((!body || body === "") && eventType === 'new_message') {
-        body = messageContent.conversation || messageContent.extendedTextMessage?.text || messageContent.imageMessage?.caption || "";
-    }
+    // 🔥 استخدام المحرك الجراحي هنا أيضاً
+    const { eventType, targetMsgId, body } = extractMessageDetails(msg);
 
     if ((!body || body.trim().length === 0) && eventType === 'new_message') return;
 
     let finalMsgId = msg.key.id;
     let finalEventType = eventType;
 
-    if (isSync && eventType === 'message_edit') {
-        finalMsgId = targetMsgId || msg.key.id; finalEventType = 'new_message'; 
-    }
+    // // حماية إضافية لحالة المزامنة
+    // if (isSync && eventType === 'message_edit') {
+    //     finalMsgId = targetMsgId || msg.key.id; finalEventType = 'new_message'; 
+    // }
 
     let payload = {
-        event_type: finalEventType, target_message_id: targetMsgId, is_sync: isSync, 
-        whatsapp_message_id: finalMsgId, sender_id: senderId, participant_phone: phone,          
-        participant_raw: participantRaw, pushName: msg.pushName || "",     
-        group_id: isGroup ? remoteJid : null, author_id: isGroup ? participantRaw : null,
-        is_group: isGroup, message_text: body, timestamp: msg.messageTimestamp
+        event_type: finalEventType,
+        target_message_id: targetMsgId,
+        is_sync: isSync, 
+        whatsapp_message_id: msg.key.id,
+        sender_id: senderId,
+        participant_phone: phone,         
+        participant_raw: participantRaw,
+        pushName: msg.pushName || "",     
+        group_id: isGroup ? remoteJid : null,
+        author_id: isGroup ? participantRaw : null,
+        is_group: isGroup,
+        message_text: body, timestamp: msg.messageTimestamp
     };
 
-    // 🔥 الأرشفة في الداتابيز (SQLite)
     try {
         let msgTime = msg.messageTimestamp;
         if (typeof msgTime !== 'number') msgTime = msgTime?.low || Math.floor(Date.now() / 1000);
         
-        // 🛡️ التصفية الذكية: هل هي فاتورة أم شات عادي؟
+        // 🛡️ إجبار SQLite على تخزين الحذف والتعديل كفاتورة لتسريع البحث
         const isInvoiceLike = /فاتور|اجر|أجر|توصيل|تعويض|غرام|مخالف|كابتن|سائق|مندوب|منسق/i.test(body);
-        const isInvoice = (isInvoiceLike && body.length > 15) ? 1 : 0;
+        const isInvoice = (isInvoiceLike && body.length > 15) || eventType === 'message_revoke' || eventType === 'message_edit' ? 1 : 0;
 
         insertMsg.run(finalMsgId, remoteJid, msgTime, isInvoice, JSON.stringify(payload));
+        
+        if (eventType === 'message_revoke') {
+            console.log(`🗑️ [LIVE REVOKE] Captured Revoke for Target: ${targetMsgId}`);
+        }
     } catch (e) {
         console.error("⚠️ Failed to insert into SQLite:", e.message);
     }
 
-    // إرسال لجانغو
+    // إرسال لجانغو (الويبهوك اللحظي سيتكفل بالحذف فوراً)
     sendToDjango(payload, msg.key, false);
 }
 
 // ==============================================================
-// 🚀 4. الروابط الـ APIs (متصلة بقاعدة البيانات)
+// 🚀 5. الروابط الـ APIs 
 // ==============================================================
-
-app.post('/force-sync', async (req, res) => {
-    const { phone, start_ts, end_ts } = req.body;
-    
-    try {
-        const jid = getJid(phone);
-        if (!jid || !start_ts || !end_ts) return res.status(400).json({ error: "Missing parameters" });
-
-        // سحب الفواتير من القرص الصلب (سريع جداً)
-        const rows = getMsgsByDate.all(jid, start_ts, end_ts);
-        
-        if (rows.length === 0) {
-            return res.json({ status: "skipped", message: "لا توجد فواتير في الأرشيف لهذا النطاق الزمني." });
-        }
-
-        res.json({ status: "started", message: `جاري ترحيل ${rows.length} فاتورة من الأرشيف السري...` });
-
-        // إرسالها لجانغو بالخلفية
-        (async () => {
-            console.log(`🔄 [Auto-Sync] Exporting ${rows.length} invoices...`);
-            for (const row of rows) {
-                try {
-                    const payload = JSON.parse(row.payload_json);
-                    payload.is_sync = true; // مهم ليعرف جانغو أنها مزامنة
-                    await sendToDjango(payload, null, true);
-                    await delay(10); 
-                } catch (e) {}
-            }
-            console.log(`✅ [Auto-Sync] Done.`);
-        })();
-
-    } catch (e) {
-        console.error("🔥 Sync Error:", e);
-        if (!res.headersSent) res.status(500).json({ error: e.message });
-    }
-});
-
-// ==============================================================
-// 🛠️ 5. الروابط الإضافية (تمت ترقيتها لتعمل على SQLite بدلاً من RAM)
-// ==============================================================
-
 // 1. جلب جرد الفواتير (Get Inventory)
 app.post('/get-inventory', async (req, res) => {
     const { phone, startDate, endDate, start_ts, end_ts } = req.body;
@@ -429,31 +389,38 @@ app.post('/get-inventory', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
-
-// 2. الاستطلاع النطاقي (Check Inventory Range)
-app.post('/check-inventory-range', async (req, res) => {
-    const { phone, start_ts, end_ts } = req.body; 
+app.post('/force-sync', async (req, res) => {
+    const { phone, start_ts, end_ts } = req.body;
+    
     try {
         const jid = getJid(phone);
-        
-        // 🔥 استعلام تجميعي (Aggregate) يحسب العدد والحدود في 1 ميلي ثانية
-        const stmt = db.prepare('SELECT COUNT(*) as count, MIN(timestamp) as min_ts, MAX(timestamp) as max_ts FROM messages WHERE jid = ? AND timestamp >= ? AND timestamp <= ?');
-        const result = stmt.get(jid, start_ts, end_ts);
+        if (!jid || !start_ts || !end_ts) return res.status(400).json({ error: "Missing parameters" });
 
-        if (!result || result.count === 0) {
-            return res.json({ status: "empty", message: "لا توجد بيانات لهذا النطاق الزمني في الأرشيف" });
+        // بفضل التعديل الجراحي (is_invoice = 1) ستقوم هذه الدالة بسحب الفواتير + رسائل الحذف والتعديل معاً!
+        const rows = getMsgsByDate.all(jid, start_ts, end_ts);
+        
+        if (rows.length === 0) {
+            return res.json({ status: "skipped", message: "لا توجد فواتير أو تعديلات في الأرشيف لهذا النطاق الزمني." });
         }
 
-        res.json({ 
-            status: "success", 
-            count: result.count,
-            min_timestamp: result.min_ts,
-            max_timestamp: result.max_ts 
-        });
+        res.json({ status: "started", message: `جاري ترحيل ${rows.length} عملية (إنشاء/تعديل/حذف)...` });
 
-    } catch (error) {
-        console.error("Check Range Error:", error);
-        res.status(500).json({ error: error.message });
+        (async () => {
+            console.log(`🔄 [Auto-Sync] Exporting ${rows.length} records...`);
+            for (const row of rows) {
+                try {
+                    const payload = JSON.parse(row.payload_json);
+                    payload.is_sync = true; 
+                    await sendToDjango(payload, null, true);
+                    await delay(10); 
+                } catch (e) {}
+            }
+            console.log(`✅ [Auto-Sync] Done.`);
+        })();
+
+    } catch (e) {
+        console.error("🔥 Sync Error:", e);
+        if (!res.headersSent) res.status(500).json({ error: e.message });
     }
 });
 
@@ -485,60 +452,6 @@ app.post('/fetch-messages-batch', async (req, res) => {
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
-});
-
-// 4. ماسح الأشباح والمحذوفات (Scan Revoked) 👻
-app.post('/scan-revoked', async (req, res) => {
-    const { phone } = req.body;
-    try {
-        const jid = getJid(phone);
-        
-        // 🔥 نبحث في الـ payload_json عن كلمة message_revoke
-        const stmt = db.prepare("SELECT payload_json FROM messages WHERE jid = ? AND payload_json LIKE '%message_revoke%'");
-        const rows = stmt.all(jid);
-
-        const revokedIds = new Set();
-        rows.forEach(row => {
-            const payload = JSON.parse(row.payload_json);
-            if (payload.target_message_id) {
-                revokedIds.add(payload.target_message_id);
-            }
-        });
-
-        console.log(`👻 [Ghost Scanner] Found ${revokedIds.size} deletion requests in SQLite archive.`);
-        
-        res.json({ status: "success", count: revokedIds.size, ids: Array.from(revokedIds) });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// 5. أوامر التحكم المباشرة (Send/React/Kick) - مطابقة للقديم تماماً
-app.post('/send-message', async (req, res) => {
-    if (!sock || !isWaConnected) return res.status(503).json({ error: "Disconnected" });
-    try {
-        await sock.sendMessage(getJid(req.body.phone), { text: req.body.message });
-        res.json({ status: 'success' });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/send-reaction', async (req, res) => {
-    if (!isWaConnected) return res.status(503).json({ error: "Disconnected" });
-    reactionQueue.push({
-        chatId: getJid(req.body.chat_id),
-        reaction: req.body.reaction,
-        key: { remoteJid: getJid(req.body.chat_id), id: req.body.message_id, fromMe: false }
-    });
-    processReactionQueue();
-    res.json({ status: 'queued' });
-});
-
-app.post('/kick-member', async (req, res) => {
-    if (!sock) return res.status(503).json({ error: "Disconnected" });
-    try {
-        await sock.groupParticipantsUpdate(getJid(req.body.group_id), [getJid(req.body.phone)], "remove");
-        res.json({ status: 'success' });
-    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // 6. أداة التشريح الجنائي المعمق (Debug Message)
@@ -595,6 +508,77 @@ app.post('/search-archive', async (req, res) => {
     }
 });
 
+// باقي الـ APIs القديمة (check-inventory-range, scan-revoked, إلخ) تعمل بكفاءة تامة ولم تتأثر.
+app.post('/check-inventory-range', async (req, res) => {
+    const { phone, start_ts, end_ts } = req.body; 
+    try {
+        const jid = getJid(phone);
+        const stmt = db.prepare('SELECT COUNT(*) as count, MIN(timestamp) as min_ts, MAX(timestamp) as max_ts FROM messages WHERE jid = ? AND timestamp >= ? AND timestamp <= ?');
+        const result = stmt.get(jid, start_ts, end_ts);
+
+        if (!result || result.count === 0) {
+            return res.json({ status: "empty", message: "لا توجد بيانات لهذا النطاق الزمني في الأرشيف" });
+        }
+
+        res.json({ 
+            status: "success", 
+            count: result.count,
+            min_timestamp: result.min_ts,
+            max_timestamp: result.max_ts 
+        });
+
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/scan-revoked', async (req, res) => {
+    const { phone } = req.body;
+    try {
+        const jid = getJid(phone);
+        const stmt = db.prepare("SELECT payload_json FROM messages WHERE jid = ? AND payload_json LIKE '%message_revoke%'");
+        const rows = stmt.all(jid);
+
+        const revokedIds = new Set();
+        rows.forEach(row => {
+            const payload = JSON.parse(row.payload_json);
+            if (payload.target_message_id) {
+                revokedIds.add(payload.target_message_id);
+            }
+        });
+
+        res.json({ status: "success", count: revokedIds.size, ids: Array.from(revokedIds) });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/send-message', async (req, res) => {
+    if (!sock || !isWaConnected) return res.status(503).json({ error: "Disconnected" });
+    try {
+        await sock.sendMessage(getJid(req.body.phone), { text: req.body.message });
+        res.json({ status: 'success' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/send-reaction', async (req, res) => {
+    if (!isWaConnected) return res.status(503).json({ error: "Disconnected" });
+    reactionQueue.push({
+        chatId: getJid(req.body.chat_id),
+        reaction: req.body.reaction,
+        key: { remoteJid: getJid(req.body.chat_id), id: req.body.message_id, fromMe: false }
+    });
+    processReactionQueue();
+    res.json({ status: 'queued' });
+});
+
+app.post('/kick-member', async (req, res) => {
+    if (!sock) return res.status(503).json({ error: "Disconnected" });
+    try {
+        await sock.groupParticipantsUpdate(getJid(req.body.group_id), [getJid(req.body.phone)], "remove");
+        res.json({ status: 'success' });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 app.get('/qr-code', async (req, res) => {
@@ -616,9 +600,7 @@ app.get('/qr-code', async (req, res) => {
             `);
         }
 
-        // تحويل كود الـ QR إلى صورة Base64
         const url = await QRCode.toDataURL(currentQR);
-        
         res.send(`
             <div style="display:flex; justify-content:center; align-items:center; height:100vh; background:#f0f2f5; font-family:sans-serif;">
                 <div style="background:white; padding:20px; border-radius:15px; box-shadow:0 4px 15px rgba(0,0,0,0.1); text-align:center;">
@@ -629,7 +611,6 @@ app.get('/qr-code', async (req, res) => {
             </div>
             <script>setTimeout(function(){location.reload()}, 15000);</script>
         `);
-
     } catch (e) {
         res.status(500).send("Error generating QR");
     }
